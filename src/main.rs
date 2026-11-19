@@ -37,8 +37,8 @@ fn main() {
                         platform::PlatformEvent::ToggleWidget => {
                             cx.update(|app| ui::windows::toggle_widget(app, pump_state.clone()));
                         }
-                        platform::PlatformEvent::ToggleOverlay => {
-                            cx.update(|app| ui::windows::toggle_overlay(app, pump_state.clone()));
+                        platform::PlatformEvent::ToggleFloat => {
+                            cx.update(|app| ui::windows::toggle_float(app, pump_state.clone()));
                         }
                         platform::PlatformEvent::Quit => {
                             println!("[wasurenai] 收到退出请求（托盘）");
@@ -50,17 +50,17 @@ fn main() {
             });
             pump.detach();
 
-            // 到期提醒：每 500ms 检查一次（条目量很小，这点开销可以忽略）
-            let reminder_state = state.clone();
-            let reminder_task = cx.spawn(async move |cx| {
+            // 每 500ms 对齐一次窗口层级：有到期提醒就自动上浮，确认完自动回落
+            let tick_state = state.clone();
+            let tick_task = cx.spawn(async move |cx| {
                 loop {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(500))
                         .await;
-                    cx.update(|app| ui::windows::refresh_reminder(app, reminder_state.clone()));
+                    cx.update(|app| ui::windows::sync_layer(app, tick_state.clone()));
                 }
             });
-            reminder_task.detach();
+            tick_task.detach();
 
             platform::win_thread::spawn(tx);
 

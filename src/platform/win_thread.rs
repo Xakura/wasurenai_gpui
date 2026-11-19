@@ -97,7 +97,7 @@ fn create_tray(tx: Sender<PlatformEvent>) -> anyhow::Result<tray_icon::TrayIcon>
             return;
         }
         let mapped = if event.id == overlay_id {
-            Some(PlatformEvent::ToggleOverlay)
+            Some(PlatformEvent::ToggleFloat)
         } else if Some(event.id) == widget_id {
             Some(PlatformEvent::ToggleWidget)
         } else {

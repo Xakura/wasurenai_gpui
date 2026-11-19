@@ -1,4 +1,9 @@
-//! 桌面层窗口的列表视图：勾选框 + 文本 + 截止时间 + 标签筛选条。
+//! 桌面层 / 置顶层共用的待办视图。
+//!
+//! 同一个窗口有两种内容：
+//! - **面板**：标签筛选条 + 全部待办（平常沉在桌面层）。
+//! - **提醒**：有到期未确认的条目时自动切换过来，并让窗口上浮到最上层；
+//!   逐条「知道了」/「全部知道了」/ 勾选完成后自动回到面板并回落桌面层。
 //!
 //! 这个窗口是"裸窗口"（没有 `gpui_base::Root`），所以不能依赖 Root 提供的
 //! Tooltip / Dialog / Popover / Notification；勾选框用 [`crate::ui::widgets::tick_box`] 手绘。
@@ -9,7 +14,7 @@ use gpui_kit::*;
 
 use crate::core::model::TodoId;
 use crate::core::ordering;
-use crate::platform::win_bottom;
+use crate::platform::win_layer;
 use crate::ui::state::AppState;
 use crate::ui::theme::panel;
 use crate::ui::widgets::tick_box;
@@ -31,12 +36,8 @@ impl WidgetWindow {
         }
     }
 
-    /// 首帧：把窗口压到桌面层。
-    ///
-    /// 置底动作（改 owner + 强制 HWND_BOTTOM）**延迟到首帧呈现之后**执行：
-    /// 在首帧绘制过程中改 owner 会把 DirectComposition 的呈现目标搞坏，
-    /// 表现为窗口 Z 序正常、`WindowFromPoint` 也能命中，但画面全空。
-    fn init_window(&mut self, window: &Window, cx: &mut Context<Self>) {
+    /// 首帧：接管窗口（owner + 子类化 + 压到桌面层）。
+    fn init_window(&mut self, window: &Window) {
         if self.initialized {
             return;
         }
@@ -46,47 +47,41 @@ impl WidgetWindow {
             eprintln!("[wasurenai] 拿不到窗口 HWND，置底失败");
             return;
         };
-        let ok = win_bottom::apply_bottom(hwnd);
+        let ok = win_layer::attach(hwnd);
         println!(
-            "[wasurenai] 桌面层置底={ok} 子类化={} hwnd={hwnd:?}",
-            win_bottom::subclassed()
+            "[wasurenai] 桌面层接管={ok} 子类化={} hwnd={hwnd:?}",
+            win_layer::subclassed()
         );
-        let _ = cx;
     }
 }
 
 impl Render for WidgetWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.init_window(window, cx);
-        if std::env::var_os("WASURENAI_DEBUG").is_some() {
-            println!(
-                "[wasurenai] widget render visible={} bounds={:?}",
-                window.is_visible(),
-                window.bounds()
-            );
-        }
+        self.init_window(window);
 
         let state = self.state.clone();
         let now = chrono::Local::now().naive_local();
 
-        // 先把要画的数据全部复制出来，渲染时不再持有 AppState 的借用。
-        let (rows, tags, active_tag, pending) = {
+        let (rows, tags, active_tag, pending, reminder) = {
             let app = state.read(cx);
-            let rows = ordering::visible(&app.store)
-                .into_iter()
-                .map(|item| Row {
-                    id: item.id,
-                    text: item.text.clone(),
-                    done: item.done,
-                    due: item.due,
-                    overdue: item.is_overdue(now),
-                })
-                .collect::<Vec<_>>();
+            let due = app.due_items(now);
+            let reminder = !due.is_empty();
+            let source: Vec<Row> = if reminder {
+                due.into_iter()
+                    .map(|item| Row::from_item(item, now))
+                    .collect()
+            } else {
+                ordering::visible(&app.store)
+                    .into_iter()
+                    .map(|item| Row::from_item(item, now))
+                    .collect()
+            };
             (
-                rows,
+                source,
                 ordering::tags(&app.store.items),
                 app.store.tag_filter.clone(),
                 ordering::pending_count(&app.store.items),
+                reminder,
             )
         };
 
@@ -102,27 +97,14 @@ impl Render for WidgetWindow {
             .gap_2()
             .text_size(px(13.0))
             .text_color(rgb(panel::TEXT))
-            .child(
-                div()
-                    .flex()
-                    .items_baseline()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(panel::MUTED))
-                            .child("待办"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(panel::ACCENT))
-                            .child(format!("{pending} 项未完成")),
-                    ),
-            )
-            // 标签筛选条：没有标签时不占地方
-            .when(!tags.is_empty(), |panel_| {
-                panel_.child(
+            .child(if reminder {
+                reminder_header(state.clone(), rows.len())
+            } else {
+                panel_header(pending)
+            })
+            // 标签筛选条只在面板模式下出现
+            .when(!reminder && !tags.is_empty(), |body| {
+                body.child(
                     div()
                         .flex()
                         .flex_wrap()
@@ -153,16 +135,73 @@ impl Render for WidgetWindow {
                                 .pt(px(6.0))
                                 .text_size(px(12.0))
                                 .text_color(rgb(panel::MUTED))
-                                .child(if active_tag.is_some() {
+                                .child(if reminder {
+                                    "没有到期的待办"
+                                } else if active_tag.is_some() {
                                     "这个标签下没有待办"
                                 } else {
                                     "暂无待办"
                                 }),
                         )
                     })
-                    .children(rows.into_iter().map(|row| todo_row(state.clone(), row))),
+                    .children(
+                        rows.into_iter()
+                            .map(|row| todo_row(state.clone(), row, reminder)),
+                    ),
             )
     }
+}
+
+fn panel_header(pending: usize) -> AnyElement {
+    div()
+        .flex()
+        .items_baseline()
+        .gap_2()
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(panel::MUTED))
+                .child("待办"),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(panel::ACCENT))
+                .child(format!("{pending} 项未完成")),
+        )
+        .into_any_element()
+}
+
+fn reminder_header(state: Entity<AppState>, count: usize) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(panel::DANGER))
+                .child(format!("到期提醒 · {count} 项")),
+        )
+        .child(div().flex_1())
+        .child(
+            div()
+                .id("ack-all")
+                .px(px(7.0))
+                .py(px(2.0))
+                .rounded(px(5.0))
+                .bg(rgba(panel::ACCENT))
+                .text_size(px(11.0))
+                .text_color(rgb(0xffffff))
+                .child("全部知道了")
+                .on_click(move |_event, _window, cx| {
+                    state.update(cx, |app, cx| {
+                        app.ack_all(chrono::Local::now().naive_local());
+                        app.commit_runtime(true, cx);
+                    });
+                }),
+        )
+        .into_any_element()
 }
 
 /// 一行要画的数据（从 `Store` 复制出来，避免渲染期间持有借用）。
@@ -174,9 +213,22 @@ struct Row {
     overdue: bool,
 }
 
-fn todo_row(state: Entity<AppState>, row: Row) -> impl IntoElement {
+impl Row {
+    fn from_item(item: &crate::core::model::TodoItem, now: NaiveDateTime) -> Self {
+        Self {
+            id: item.id,
+            text: item.text.clone(),
+            done: item.done,
+            due: item.due,
+            overdue: item.is_overdue(now),
+        }
+    }
+}
+
+fn todo_row(state: Entity<AppState>, row: Row, reminder: bool) -> impl IntoElement {
     let id = row.id;
-    let toggler = state;
+    let toggler = state.clone();
+    let acker = state;
 
     div()
         .id(("todo-row", id as usize))
@@ -187,12 +239,16 @@ fn todo_row(state: Entity<AppState>, row: Row) -> impl IntoElement {
         .py(px(5.0))
         .rounded(px(6.0))
         .hover(|style| style.bg(rgba(panel::ROW_HOVER)))
-        .child(tick_box(("todo-done", id as usize), row.done, move |next, _window, cx| {
-            toggler.update(cx, |app, cx| {
-                let changed = app.set_done(id, next);
-                app.commit_click(changed, cx);
-            });
-        }))
+        .child(tick_box(
+            ("todo-done", id as usize),
+            row.done,
+            move |next, _window, cx| {
+                toggler.update(cx, |app, cx| {
+                    let changed = app.set_done(id, next);
+                    app.commit_click(changed, cx);
+                });
+            },
+        ))
         .child(
             div()
                 .flex_1()
@@ -214,6 +270,25 @@ fn todo_row(state: Entity<AppState>, row: Row) -> impl IntoElement {
                         rgb(panel::MUTED)
                     })
                     .child(due.format("%m-%d %H:%M").to_string()),
+            )
+        })
+        .when(reminder, |line| {
+            line.child(
+                div()
+                    .id(("todo-ack", id as usize))
+                    .px(px(7.0))
+                    .py(px(1.0))
+                    .rounded(px(5.0))
+                    .bg(rgba(panel::CHIP))
+                    .text_size(px(11.0))
+                    .text_color(rgb(panel::CHIP_TEXT))
+                    .child("知道了")
+                    .on_click(move |_event, _window, cx| {
+                        acker.update(cx, |app, cx| {
+                            app.ack(id);
+                            app.commit_runtime(true, cx);
+                        });
+                    }),
             )
         })
 }

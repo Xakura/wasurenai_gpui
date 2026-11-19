@@ -26,6 +26,8 @@ pub struct AppState {
     save_generation: u64,
     /// 本次运行里已经点过「知道了」的提醒项（不持久化：重启后逾期项会再提醒一次）。
     acked: HashSet<TodoId>,
+    /// 用户是否用快捷键把窗口浮到了最上层（不持久化）。
+    pub user_floated: bool,
 }
 
 impl AppState {
@@ -36,6 +38,7 @@ impl AppState {
             path: store::data_path(),
             save_generation: 0,
             acked: HashSet::new(),
+            user_floated: false,
         }
     }
 
@@ -46,6 +49,7 @@ impl AppState {
             path,
             save_generation: 0,
             acked: HashSet::new(),
+            user_floated: false,
         }
     }
 

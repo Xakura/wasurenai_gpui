@@ -12,7 +12,6 @@
 //!   用裸 `cx.open_window`。
 
 pub mod editor;
-pub mod overlay;
 pub mod state;
 pub mod theme;
 pub mod widget;

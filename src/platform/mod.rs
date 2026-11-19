@@ -2,7 +2,7 @@
 //!
 //! 依赖方向：ui → platform，platform 不依赖 core / ui。
 
-pub mod win_bottom;
+pub mod win_layer;
 pub mod win_thread;
 
 /// 平台线程发给 gpui 主线程的事件。
@@ -14,8 +14,8 @@ pub enum PlatformEvent {
     OpenEditor,
     /// 托盘「收起 / 展开」被点击。
     ToggleWidget,
-    /// 全局快捷键：切换置顶浮层。
-    ToggleOverlay,
+    /// 全局快捷键：桌面层窗口上浮 / 回落。
+    ToggleFloat,
     /// 托盘「退出」被点击。
     Quit,
 }
