@@ -4,3 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# gpui 门面：gpui-pre 0.3.12 + gpui-base 0.10 + gpui-component 0.10
+gpui-kit = "=0.10.0"
+anyhow = "1"
+async-channel = "2"
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Controls",
+] }
+tray-icon = "0.26"
+global-hotkey = "0.10"
