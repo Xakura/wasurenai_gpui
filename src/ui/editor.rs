@@ -8,7 +8,6 @@
 //! 行只在「新增/删除」时增删——不在 render 里创建 entity。
 
 use chrono::Local;
-use gpui_kit::component::button::Button;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Sizable as _, StyledExt as _};
@@ -314,13 +313,15 @@ impl Render for EditorWindow {
         // 防御：外部新增/删除了条目时对齐一次
         self.sync_rows(window, cx);
 
+        let now = chrono::Local::now().naive_local();
         let (done_map, hotkey, hotkey_error, pending) = {
             let app = self.state.read(cx);
-            let done_map: Vec<(TodoId, bool)> = app
+            // (id, 已完成, 已逾期)
+            let done_map: Vec<(TodoId, bool, bool)> = app
                 .store
                 .items
                 .iter()
-                .map(|item| (item.id, item.done))
+                .map(|item| (item.id, item.done, item.is_overdue(now)))
                 .collect();
             (
                 done_map,
@@ -331,84 +332,140 @@ impl Render for EditorWindow {
         };
         let is_empty = self.rows.is_empty();
         let recording = self.recording;
-        let note = self.hotkey_note.clone();
+        let note = self.hotkey_note.clone().or(hotkey_error);
 
-        let mut rows = div().flex().flex_col();
-        for row in &self.rows {
+        let mut list = div().flex().flex_col();
+        for (index, row) in self.rows.iter().enumerate() {
             let id = row.id;
-            let done = done_map
+            let (done, overdue) = done_map
                 .iter()
-                .find(|(item_id, _)| *item_id == id)
-                .map(|(_, done)| *done)
-                .unwrap_or(false);
+                .find(|(item_id, _, _)| *item_id == id)
+                .map(|(_, done, overdue)| (*done, *overdue))
+                .unwrap_or((false, false));
             let due_error = row.due_error.clone();
             let toggler = self.state.clone();
+            let has_error = due_error.is_some();
 
-            rows = rows.child(
+            // 行之间用细线分隔，第一行前面不加
+            if index > 0 {
+                list = list.child(
+                    div()
+                        .h(px(1.0))
+                        .w_full()
+                        .bg(rgba(palette::BORDER)),
+                );
+            }
+
+            list = list.child(
                 div()
                     .id(("editor-row", id as usize))
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px(px(4.0))
-                    .py(px(10.0))
-                    .border_b_1()
-                    .border_color(rgba(palette::BORDER))
-                    .hover(|style| style.bg(rgb(palette::HOVER)))
-                    // 第一行：勾选框 + 内容 + 删除
+                    .items_start()
+                    .gap_3()
+                    .px(px(8.0))
+                    .py(px(9.0))
+                    .rounded(px(6.0))
+                    .hover(|style| style.bg(rgba(palette::HOVER)))
+                    .child(
+                        div().pt(px(2.0)).child(
+                            Checkbox::new(format!("edit-done-{id}"))
+                                .checked(done)
+                                .on_change(move |checked, _window, cx| {
+                                    toggler.update(cx, |app, cx| {
+                                        let changed = app.set_done(id, *checked);
+                                        app.commit_click(changed, cx);
+                                    });
+                                }),
+                        ),
+                    )
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Checkbox::new(format!("edit-done-{id}"))
-                                    .checked(done)
-                                    .on_change(move |checked, _window, cx| {
-                                        toggler.update(cx, |app, cx| {
-                                            let changed = app.set_done(id, *checked);
-                                            app.commit_click(changed, cx);
-                                        });
-                                    }),
-                            )
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .min_w_0()
+                            .when(done, |column| column.opacity(0.55))
+                            // 内容：无边框输入，平时看起来就是一行文字
+                            .child(Input::new(&row.text).appearance(false))
+                            // 元信息：时间 + 标签 + 解析错误
                             .child(
                                 div()
-                                    .flex_1()
-                                    .when(done, |input| input.opacity(0.55))
-                                    .child(Input::new(&row.text)),
-                            )
-                            .child(
-                                Button::new(format!("edit-del-{id}"))
-                                    .label("×")
-                                    .outline()
-                                    .compact()
-                                    .tooltip("删除这条")
-                                    .on_click(cx.listener(move |this, _, _window, cx| {
-                                        this.delete_row(id, cx);
-                                    })),
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .w(px(148.0))
+                                            .text_size(px(11.0))
+                                            .text_color(if has_error || overdue {
+                                                rgb(palette::DANGER)
+                                            } else {
+                                                rgb(palette::MUTED)
+                                            })
+                                            .child(Input::new(&row.due).appearance(false).small()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_0p5()
+                                            .w(px(120.0))
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(palette::MUTED))
+                                            .child(div().child("#"))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .child(
+                                                        Input::new(&row.tag)
+                                                            .appearance(false)
+                                                            .small(),
+                                                    ),
+                                            ),
+                                    )
+                                    .when_some(due_error, |line, message| {
+                                        line.child(
+                                            div()
+                                                .flex_1()
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(palette::DANGER))
+                                                .child(message),
+                                        )
+                                    }),
                             ),
                     )
-                    // 第二行：时间 + 标签（小号）+ 解析错误
+                    // 删除：安静的 ×，hover 才变红
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .pl(px(26.0))
-                            .child(div().w(px(184.0)).child(Input::new(&row.due).small()))
-                            .child(div().w(px(140.0)).child(Input::new(&row.tag).small()))
-                            .when_some(due_error, |line, message| {
-                                line.child(
-                                    div()
-                                        .flex_1()
-                                        .text_size(px(11.0))
-                                        .text_color(rgb(palette::DANGER))
-                                        .child(message),
-                                )
-                            }),
+                            .id(("editor-del", id as usize))
+                            .w(px(18.0))
+                            .text_size(px(13.0))
+                            .text_color(rgb(palette::MUTED))
+                            .hover(|style| style.text_color(rgb(palette::DANGER)))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.delete_row(id, cx);
+                            })),
                     ),
             );
         }
+
+        let record_button = if recording {
+            text_link(
+                "hotkey-cancel",
+                "取消",
+                palette::MUTED,
+                cx.listener(|this, _, _window, cx| this.cancel_recording(cx)),
+            )
+        } else {
+            text_link(
+                "hotkey-record",
+                "修改",
+                palette::ACCENT,
+                cx.listener(|this, _, window, cx| this.start_recording(window, cx)),
+            )
+        };
 
         div()
             .id("editor-root")
@@ -421,17 +478,17 @@ impl Render for EditorWindow {
             .flex()
             .flex_col()
             .text_size(px(13.0))
-            .line_height(px(22.0))
+            .line_height(px(21.0))
             .text_color(rgb(palette::TEXT))
-            // 顶部：标题 + 未完成计数
+            // 标题
             .child(
                 div()
                     .flex()
                     .items_baseline()
                     .gap_2()
-                    .px(px(16.0))
-                    .pt(px(14.0))
-                    .pb(px(10.0))
+                    .px(px(20.0))
+                    .pt(px(16.0))
+                    .pb(px(12.0))
                     .child(
                         div()
                             .text_size(px(15.0))
@@ -451,7 +508,7 @@ impl Render for EditorWindow {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .px(px(16.0))
+                    .px(px(20.0))
                     .py(px(10.0))
                     .border_t_1()
                     .border_b_1()
@@ -463,53 +520,50 @@ impl Render for EditorWindow {
                             .gap_3()
                             .child(
                                 div()
-                                    .w(px(48.0))
+                                    .w(px(44.0))
                                     .text_size(px(11.0))
                                     .text_color(rgb(palette::MUTED))
                                     .child("快捷键"),
                             )
-                            .child(
+                            .child(if recording {
                                 div()
                                     .flex_1()
                                     .text_size(px(12.0))
-                                    .text_color(if recording {
-                                        rgb(palette::ACCENT)
-                                    } else {
-                                        rgb(palette::TEXT)
-                                    })
-                                    .child(if recording {
-                                        "按下新的组合键…（Esc 取消）".to_string()
-                                    } else {
-                                        hotkey.clone()
-                                    }),
-                            )
-                            .child(
-                                Button::new("hotkey-record")
-                                    .label(if recording { "取消" } else { "修改" })
-                                    .outline()
-                                    .compact()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        if this.recording {
-                                            this.cancel_recording(cx);
-                                        } else {
-                                            this.start_recording(window, cx);
-                                        }
-                                    })),
-                            )
-                            .child(
-                                Button::new("hotkey-reset")
-                                    .label("恢复默认")
-                                    .outline()
-                                    .compact()
-                                    .on_click(cx.listener(|this, _, _window, cx| {
-                                        this.reset_hotkey(cx);
-                                    })),
-                            ),
+                                    .text_color(rgb(palette::ACCENT))
+                                    .child("按下新的组合键…（Esc 取消）")
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(4.0))
+                                            .border_1()
+                                            .border_color(rgba(palette::BORDER))
+                                            .bg(rgb(palette::SURFACE))
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(palette::TEXT))
+                                            .child(hotkey.clone()),
+                                    )
+                                    .into_any_element()
+                            })
+                            .child(record_button)
+                            .child(text_link(
+                                "hotkey-reset",
+                                "恢复默认",
+                                palette::MUTED,
+                                cx.listener(|this, _, _window, cx| this.reset_hotkey(cx)),
+                            )),
                     )
-                    .when_some(note.or(hotkey_error), |section, message| {
+                    .when_some(note, |section, message| {
                         section.child(
                             div()
-                                .pl(px(60.0))
+                                .pl(px(56.0))
                                 .text_size(px(11.0))
                                 .text_color(rgb(palette::DANGER))
                                 .child(message),
@@ -523,46 +577,61 @@ impl Render for EditorWindow {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .px(px(16.0))
+                    .px(px(12.0))
+                    .py(px(4.0))
                     .overflow_y_scroll()
-                    .when(is_empty, |list| {
-                        list.child(
+                    .when(is_empty, |area| {
+                        area.child(
                             div()
+                                .px(px(8.0))
                                 .py(px(28.0))
                                 .text_size(px(12.0))
                                 .text_color(rgb(palette::MUTED))
-                                .child("还没有待办 · 点右下角「＋ 新增」"),
+                                .child("还没有待办 · 点下面的「＋ 新增」"),
                         )
                     })
-                    .child(rows),
+                    .child(list),
             )
-            // 底部操作条
+            // 底部
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .px(px(16.0))
+                    .gap_4()
+                    .px(px(20.0))
                     .py(px(10.0))
                     .border_t_1()
                     .border_color(rgba(palette::BORDER))
-                    .child(
-                        Button::new("editor-add")
-                            .label("＋ 新增")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.add_row(window, cx);
-                            })),
-                    )
+                    .child(text_link(
+                        "editor-add",
+                        "＋ 新增",
+                        palette::ACCENT,
+                        cx.listener(|this, _, window, cx| this.add_row(window, cx)),
+                    ))
                     .child(div().flex_1())
-                    .child(
-                        Button::new("editor-close")
-                            .label("关闭")
-                            .outline()
-                            .compact()
-                            .on_click(cx.listener(|_, _, window, _cx| {
-                                window.remove_window();
-                            })),
-                    ),
+                    .child(text_link(
+                        "editor-close",
+                        "关闭",
+                        palette::MUTED,
+                        cx.listener(|_, _, window, _cx| window.remove_window()),
+                    )),
             )
     }
+}
+
+/// 文字按钮：没有框、没有底色，靠颜色和 hover 表达可点击。
+fn text_link(
+    id: &'static str,
+    label: &'static str,
+    color: u32,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .text_size(px(12.0))
+        .text_color(rgb(color))
+        .hover(|style| style.opacity(0.7))
+        .child(label)
+        .on_click(on_click)
+        .into_any_element()
 }

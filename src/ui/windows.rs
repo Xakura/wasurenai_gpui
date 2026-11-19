@@ -213,6 +213,8 @@ pub fn open_editor(cx: &mut App, state: Entity<AppState>) {
         Ok((handle, _)) => {
             println!("[wasurenai] 编辑窗口已打开");
             cx.global_mut::<Windows>().editor = Some(handle);
+            // 新建的窗口不一定会被系统提到前台（实测会被终端等窗口挡住），显式激活一次
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
         }
         Err(err) => eprintln!("[wasurenai] 编辑窗口打开失败：{err:#}"),
     }
