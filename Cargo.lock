@@ -7447,9 +7447,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "chrono",
+ "dirs 6.0.0",
  "global-hotkey",
  "gpui-kit",
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "tray-icon",
  "windows 0.62.2",
 ]
