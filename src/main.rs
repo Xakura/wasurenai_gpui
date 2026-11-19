@@ -33,7 +33,22 @@ fn main() {
                 while let Ok(event) = rx.recv().await {
                     match event {
                         platform::PlatformEvent::OpenEditor => {
-                            cx.update(|app| ui::windows::open_editor(app, pump_state.clone()));
+                            cx.update(|app| {
+                                ui::windows::open_editor(
+                                    app,
+                                    pump_state.clone(),
+                                    ui::editor::Tab::Todos,
+                                )
+                            });
+                        }
+                        platform::PlatformEvent::OpenSettings => {
+                            cx.update(|app| {
+                                ui::windows::open_editor(
+                                    app,
+                                    pump_state.clone(),
+                                    ui::editor::Tab::Settings,
+                                )
+                            });
                         }
                         platform::PlatformEvent::ToggleWidget => {
                             cx.update(|app| ui::windows::toggle_widget(app, pump_state.clone()));

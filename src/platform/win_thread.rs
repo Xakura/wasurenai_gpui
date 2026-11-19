@@ -272,10 +272,18 @@ fn key_code(key: &str) -> Option<Code> {
 fn create_tray(tx: Sender<PlatformEvent>) -> anyhow::Result<tray_icon::TrayIcon> {
     let menu = Menu::new();
     let edit = MenuItem::new("编辑内容", true, None);
+    let settings = MenuItem::new("设置", true, None);
     let toggle = MenuItem::new("收起 / 展开", true, None);
     let quit = MenuItem::new("退出", true, None);
-    menu.append_items(&[&edit, &toggle, &PredefinedMenuItem::separator(), &quit])?;
+    menu.append_items(&[
+        &edit,
+        &settings,
+        &toggle,
+        &PredefinedMenuItem::separator(),
+        &quit,
+    ])?;
     let edit_id = edit.id().clone();
+    let settings_id = settings.id().clone();
     let toggle_id = toggle.id().clone();
     let quit_id = quit.id().clone();
 
@@ -290,6 +298,8 @@ fn create_tray(tx: Sender<PlatformEvent>) -> anyhow::Result<tray_icon::TrayIcon>
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let mapped = if event.id == edit_id {
             Some(PlatformEvent::OpenEditor)
+        } else if event.id == settings_id {
+            Some(PlatformEvent::OpenSettings)
         } else if event.id == toggle_id {
             Some(PlatformEvent::ToggleWidget)
         } else if event.id == quit_id {

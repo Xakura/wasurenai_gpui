@@ -4,7 +4,7 @@
 use gpui_kit::*;
 
 use crate::platform::win_layer::{self, Layer};
-use crate::ui::editor::EditorWindow;
+use crate::ui::editor::{EditorWindow, Tab};
 use crate::ui::state::AppState;
 use crate::ui::widget::WidgetWindow;
 
@@ -13,6 +13,8 @@ use crate::ui::widget::WidgetWindow;
 pub struct Windows {
     pub widget: Option<AnyWindowHandle>,
     pub editor: Option<AnyWindowHandle>,
+    /// 编辑窗口的根视图，用来在窗口已打开时切页签。
+    pub editor_view: Option<Entity<EditorWindow>>,
 }
 
 impl Global for Windows {}
@@ -164,10 +166,10 @@ pub fn sync_layer(cx: &mut App, state: Entity<AppState>) {
     }
 }
 
-/// 编辑窗口的位置：屏幕居中，760x560。
+/// 编辑窗口的位置：屏幕居中，860x600。
 fn editor_bounds(cx: &mut App) -> Bounds<Pixels> {
     let screen = screen_bounds(cx);
-    let (width, height) = (px(760.0), px(560.0));
+    let (width, height) = (px(860.0), px(600.0));
     Bounds::new(
         point(
             screen.origin.x + (screen.size.width - width) * 0.5,
@@ -177,16 +179,20 @@ fn editor_bounds(cx: &mut App) -> Bounds<Pixels> {
     )
 }
 
-/// 打开编辑窗口；已经开着就把它拉到前台。
-pub fn open_editor(cx: &mut App, state: Entity<AppState>) {
+/// 打开编辑窗口并切到指定页签；已经开着就切页 + 拉到前台。
+pub fn open_editor(cx: &mut App, state: Entity<AppState>, tab: Tab) {
     if let Some(handle) = cx.global::<Windows>().editor {
-        if handle
+        let alive = handle
             .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
-        {
+            .is_ok();
+        if alive {
+            if let Some(view) = cx.global::<Windows>().editor_view.clone() {
+                view.update(cx, |editor, cx| editor.set_tab(tab, cx));
+            }
             return;
         }
         cx.global_mut::<Windows>().editor = None;
+        cx.global_mut::<Windows>().editor_view = None;
     }
 
     let options = WindowOptions {
@@ -203,16 +209,17 @@ pub fn open_editor(cx: &mut App, state: Entity<AppState>) {
         is_resizable: true,
         is_minimizable: true,
         window_background: WindowBackgroundAppearance::Opaque,
-        window_min_size: Some(size(px(560.0), px(320.0))),
+        window_min_size: Some(size(px(700.0), px(420.0))),
         ..Default::default()
     };
 
     match gpui_kit::open_window(options, cx, move |window, cx| {
-        cx.new(|cx| EditorWindow::new(state, window, cx))
+        cx.new(|cx| EditorWindow::new(state, tab, window, cx))
     }) {
-        Ok((handle, _)) => {
-            println!("[wasurenai] 编辑窗口已打开");
+        Ok((handle, view)) => {
+            println!("[wasurenai] 编辑窗口已打开 tab={tab:?}");
             cx.global_mut::<Windows>().editor = Some(handle);
+            cx.global_mut::<Windows>().editor_view = Some(view);
             // 新建的窗口不一定会被系统提到前台（实测会被终端等窗口挡住），显式激活一次
             let _ = handle.update(cx, |_, window, _| window.activate_window());
         }

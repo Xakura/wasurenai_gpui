@@ -1,10 +1,12 @@
-//! 编辑窗口：结构化行编辑（每行 = 勾选框 + 内容 + 截止时间 + 标签 + 删除），
-//! 外加全局快捷键的设置（录制 / 恢复默认）。
+//! 编辑窗口：顶部「待办 / 设置」两页。
+//!
+//! - 待办页：单行表格式清单（勾选框 · 内容 · 截止时间 · 标签 · 删除），列宽固定所以能对齐。
+//! - 设置页：全局快捷键（录制 / 恢复默认），以后放主题、开机自启等。
 //!
 //! 这个窗口走 `gpui_kit::open_window`（有 `Root`），所以可以用 gpui-component 的
 //! 输入框/按钮；桌面层窗口则不行（见 `ui/mod.rs`）。
 //!
-//! 输入框是 entity（`InputState`），每一行的三个输入框在行创建时生成一次并常驻，
+//! 输入框是 entity（`InputState`），每行的三个输入框在行创建时生成一次并常驻，
 //! 行只在「新增/删除」时增删——不在 render 里创建 entity。
 
 use chrono::Local;
@@ -23,13 +25,29 @@ use crate::ui::theme::editor as palette;
 /// 新建待办时填入的占位内容（`Store::add` 不接受空文本）。
 const NEW_ITEM_TEXT: &str = "新待办";
 
+// 列宽（固定，保证每行对齐）
+const COL_CHECK: f32 = 20.0;
+const COL_DUE: f32 = 168.0;
+const COL_TAG: f32 = 120.0;
+const COL_DEL: f32 = 18.0;
+const GAP: f32 = 12.0;
+const PAD_X: f32 = 20.0;
+
+/// 编辑窗口的两页。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Todos,
+    Settings,
+}
+
 pub struct EditorWindow {
     state: Entity<AppState>,
+    tab: Tab,
     rows: Vec<RowEditors>,
     /// 是否正在录制快捷键。
     recording: bool,
     recording_focus: FocusHandle,
-    /// 快捷键操作的提示（校验失败/注册失败原因）。
+    /// 快捷键操作的提示（校验失败原因）。
     hotkey_note: Option<String>,
 }
 
@@ -43,9 +61,15 @@ struct RowEditors {
 }
 
 impl EditorWindow {
-    pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        tab: Tab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self {
             state: state.clone(),
+            tab,
             rows: Vec::new(),
             recording: false,
             recording_focus: cx.focus_handle(),
@@ -57,6 +81,14 @@ impl EditorWindow {
 
         this.sync_rows(window, cx);
         this
+    }
+
+    /// 切换页签（托盘「设置」入口也会调它）。
+    pub fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        if self.tab != tab {
+            self.tab = tab;
+            cx.notify();
+        }
     }
 
     /// 让行与 store 对齐：新增缺失的行，丢掉已删除的行。
@@ -104,12 +136,12 @@ impl EditorWindow {
         });
         let due_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("18:00")
+                .placeholder("—")
                 .default_value(due)
         });
         let tag_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("标签")
+                .placeholder("—")
                 .default_value(tag)
         });
 
@@ -216,6 +248,13 @@ impl EditorWindow {
         cx.notify();
     }
 
+    /// 当前第一条时间解析错误（显示在列表下方的状态条里，保持行内对齐）。
+    fn due_error_message(&self) -> Option<String> {
+        self.rows
+            .iter()
+            .find_map(|row| row.due_error.clone())
+    }
+
     // ---- 快捷键设置 ----
 
     fn start_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -231,12 +270,7 @@ impl EditorWindow {
         cx.notify();
     }
 
-    fn on_hotkey_key(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_hotkey_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.recording {
             return;
         }
@@ -313,158 +347,31 @@ impl Render for EditorWindow {
         // 防御：外部新增/删除了条目时对齐一次
         self.sync_rows(window, cx);
 
-        let now = chrono::Local::now().naive_local();
-        let (done_map, hotkey, hotkey_error, pending) = {
+        let now = Local::now().naive_local();
+        let (rows_state, hotkey, hotkey_error, pending) = {
             let app = self.state.read(cx);
             // (id, 已完成, 已逾期)
-            let done_map: Vec<(TodoId, bool, bool)> = app
+            let rows_state: Vec<(TodoId, bool, bool)> = app
                 .store
                 .items
                 .iter()
                 .map(|item| (item.id, item.done, item.is_overdue(now)))
                 .collect();
             (
-                done_map,
+                rows_state,
                 app.hotkey().format(),
                 app.hotkey_error.clone(),
                 app.store.items.iter().filter(|item| !item.done).count(),
             )
         };
-        let is_empty = self.rows.is_empty();
+
+        let tab = self.tab;
         let recording = self.recording;
         let note = self.hotkey_note.clone().or(hotkey_error);
 
-        let mut list = div().flex().flex_col();
-        for (index, row) in self.rows.iter().enumerate() {
-            let id = row.id;
-            let (done, overdue) = done_map
-                .iter()
-                .find(|(item_id, _, _)| *item_id == id)
-                .map(|(_, done, overdue)| (*done, *overdue))
-                .unwrap_or((false, false));
-            let due_error = row.due_error.clone();
-            let toggler = self.state.clone();
-            let has_error = due_error.is_some();
-
-            // 行之间用细线分隔，第一行前面不加
-            if index > 0 {
-                list = list.child(
-                    div()
-                        .h(px(1.0))
-                        .w_full()
-                        .bg(rgba(palette::BORDER)),
-                );
-            }
-
-            list = list.child(
-                div()
-                    .id(("editor-row", id as usize))
-                    .flex()
-                    .items_start()
-                    .gap_3()
-                    .px(px(8.0))
-                    .py(px(9.0))
-                    .rounded(px(6.0))
-                    .hover(|style| style.bg(rgba(palette::HOVER)))
-                    .child(
-                        div().pt(px(2.0)).child(
-                            Checkbox::new(format!("edit-done-{id}"))
-                                .checked(done)
-                                .on_change(move |checked, _window, cx| {
-                                    toggler.update(cx, |app, cx| {
-                                        let changed = app.set_done(id, *checked);
-                                        app.commit_click(changed, cx);
-                                    });
-                                }),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .flex_1()
-                            .min_w_0()
-                            .when(done, |column| column.opacity(0.55))
-                            // 内容：无边框输入，平时看起来就是一行文字
-                            .child(Input::new(&row.text).appearance(false))
-                            // 元信息：时间 + 标签 + 解析错误
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .w(px(148.0))
-                                            .text_size(px(11.0))
-                                            .text_color(if has_error || overdue {
-                                                rgb(palette::DANGER)
-                                            } else {
-                                                rgb(palette::MUTED)
-                                            })
-                                            .child(Input::new(&row.due).appearance(false).small()),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_0p5()
-                                            .w(px(120.0))
-                                            .text_size(px(11.0))
-                                            .text_color(rgb(palette::MUTED))
-                                            .child(div().child("#"))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .child(
-                                                        Input::new(&row.tag)
-                                                            .appearance(false)
-                                                            .small(),
-                                                    ),
-                                            ),
-                                    )
-                                    .when_some(due_error, |line, message| {
-                                        line.child(
-                                            div()
-                                                .flex_1()
-                                                .text_size(px(11.0))
-                                                .text_color(rgb(palette::DANGER))
-                                                .child(message),
-                                        )
-                                    }),
-                            ),
-                    )
-                    // 删除：安静的 ×，hover 才变红
-                    .child(
-                        div()
-                            .id(("editor-del", id as usize))
-                            .w(px(18.0))
-                            .text_size(px(13.0))
-                            .text_color(rgb(palette::MUTED))
-                            .hover(|style| style.text_color(rgb(palette::DANGER)))
-                            .child("×")
-                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                this.delete_row(id, cx);
-                            })),
-                    ),
-            );
-        }
-
-        let record_button = if recording {
-            text_link(
-                "hotkey-cancel",
-                "取消",
-                palette::MUTED,
-                cx.listener(|this, _, _window, cx| this.cancel_recording(cx)),
-            )
-        } else {
-            text_link(
-                "hotkey-record",
-                "修改",
-                palette::ACCENT,
-                cx.listener(|this, _, window, cx| this.start_recording(window, cx)),
-            )
+        let content = match tab {
+            Tab::Todos => self.render_todos(cx, &rows_state),
+            Tab::Settings => self.render_settings(cx, &hotkey, recording, note),
         };
 
         div()
@@ -478,112 +385,196 @@ impl Render for EditorWindow {
             .flex()
             .flex_col()
             .text_size(px(13.0))
-            .line_height(px(21.0))
+            .line_height(px(20.0))
             .text_color(rgb(palette::TEXT))
-            // 标题
+            // 页签栏
             .child(
                 div()
                     .flex()
-                    .items_baseline()
-                    .gap_2()
-                    .px(px(20.0))
-                    .pt(px(16.0))
-                    .pb(px(12.0))
+                    .items_center()
+                    .gap_5()
+                    .px(px(PAD_X))
+                    .pt(px(10.0))
+                    .border_b_1()
+                    .border_color(rgba(palette::BORDER))
+                    .child(tab_button("tab-todos", "待办", tab == Tab::Todos, cx))
+                    .child(tab_button(
+                        "tab-settings",
+                        "设置",
+                        tab == Tab::Settings,
+                        cx,
+                    ))
+                    .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(15.0))
-                            .font_semibold()
-                            .child("待办事项"),
-                    )
-                    .child(
-                        div()
+                            .pb(px(10.0))
                             .text_size(px(11.0))
                             .text_color(rgb(palette::MUTED))
                             .child(format!("{pending} 项未完成")),
                     ),
             )
-            // 快捷键设置
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .px(px(20.0))
-                    .py(px(10.0))
-                    .border_t_1()
-                    .border_b_1()
-                    .border_color(rgba(palette::BORDER))
+                    .flex_1()
+                    .min_h_0()
+                    .child(content),
+            )
+    }
+}
+
+impl EditorWindow {
+    fn render_todos(
+        &mut self,
+        cx: &mut Context<Self>,
+        rows_state: &[(TodoId, bool, bool)],
+    ) -> AnyElement {
+        let is_empty = self.rows.is_empty();
+        let due_error = self.due_error_message();
+
+        // 表头：列宽与每行一致，所以能对齐
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(GAP))
+            .px(px(PAD_X))
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(rgba(palette::BORDER))
+            .child(div().w(px(COL_CHECK)))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(11.0))
+                    .text_color(rgb(palette::MUTED))
+                    .child("内容"),
+            )
+            .child(
+                div()
+                    .w(px(COL_DUE))
+                    .text_size(px(11.0))
+                    .text_color(rgb(palette::MUTED))
+                    .child("截止时间"),
+            )
+            .child(
+                div()
+                    .w(px(COL_TAG))
+                    .text_size(px(11.0))
+                    .text_color(rgb(palette::MUTED))
+                    .child("标签"),
+            )
+            .child(div().w(px(COL_DEL)));
+
+        let mut list = div().flex().flex_col();
+        for row in &self.rows {
+            let id = row.id;
+            let (done, overdue) = rows_state
+                .iter()
+                .find(|(item_id, _, _)| *item_id == id)
+                .map(|(_, done, overdue)| (*done, *overdue))
+                .unwrap_or((false, false));
+            let row_has_error = row.due_error.is_some();
+            let toggler = self.state.clone();
+
+            list = list.child(
+                div()
+                    .id(("editor-row", id as usize))
+                    .flex()
+                    .items_center()
+                    .gap(px(GAP))
+                    .px(px(PAD_X))
+                    .py(px(5.0))
+                    .hover(|style| style.bg(rgba(palette::HOVER)))
+                    .child(
+                        div()
+                            .w(px(COL_CHECK))
+                            .child(
+                                Checkbox::new(format!("edit-done-{id}"))
+                                    .checked(done)
+                                    .on_change(move |checked, _window, cx| {
+                                        toggler.update(cx, |app, cx| {
+                                            let changed = app.set_done(id, *checked);
+                                            app.commit_click(changed, cx);
+                                        });
+                                    }),
+                            ),
+                    )
+                    // 内容：无边框输入，平时看起来就是一行文字
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(if done {
+                                rgb(palette::MUTED)
+                            } else {
+                                rgb(palette::TEXT)
+                            })
+                            .child(Input::new(&row.text).appearance(false)),
+                    )
+                    // 截止时间：逾期或解析失败标红
+                    .child(
+                        div()
+                            .w(px(COL_DUE))
+                            .text_size(px(12.0))
+                            .text_color(if row_has_error || overdue {
+                                rgb(palette::DANGER)
+                            } else {
+                                rgb(palette::MUTED)
+                            })
+                            .child(Input::new(&row.due).appearance(false).small()),
+                    )
+                    // 标签：带 # 前缀
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_3()
+                            .gap_1()
+                            .w(px(COL_TAG))
+                            .text_size(px(12.0))
+                            .text_color(rgb(palette::MUTED))
+                            .child(div().child("#"))
                             .child(
                                 div()
-                                    .w(px(44.0))
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(palette::MUTED))
-                                    .child("快捷键"),
-                            )
-                            .child(if recording {
-                                div()
                                     .flex_1()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(palette::ACCENT))
-                                    .child("按下新的组合键…（Esc 取消）")
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .px(px(6.0))
-                                            .py(px(2.0))
-                                            .rounded(px(4.0))
-                                            .border_1()
-                                            .border_color(rgba(palette::BORDER))
-                                            .bg(rgb(palette::SURFACE))
-                                            .text_size(px(11.0))
-                                            .text_color(rgb(palette::TEXT))
-                                            .child(hotkey.clone()),
-                                    )
-                                    .into_any_element()
-                            })
-                            .child(record_button)
-                            .child(text_link(
-                                "hotkey-reset",
-                                "恢复默认",
-                                palette::MUTED,
-                                cx.listener(|this, _, _window, cx| this.reset_hotkey(cx)),
-                            )),
+                                    .min_w_0()
+                                    .child(Input::new(&row.tag).appearance(false).small()),
+                            ),
                     )
-                    .when_some(note, |section, message| {
-                        section.child(
-                            div()
-                                .pl(px(56.0))
-                                .text_size(px(11.0))
-                                .text_color(rgb(palette::DANGER))
-                                .child(message),
-                        )
-                    }),
-            )
-            // 列表
+                    // 删除：安静的 ×，hover 才变红
+                    .child(
+                        div()
+                            .id(("editor-del", id as usize))
+                            .w(px(COL_DEL))
+                            .text_size(px(13.0))
+                            .text_color(rgb(palette::MUTED))
+                            .hover(|style| style.text_color(rgb(palette::DANGER)))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.delete_row(id, cx);
+                            })),
+                    ),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(header)
             .child(
                 div()
                     .id("editor-list")
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .px(px(12.0))
-                    .py(px(4.0))
+                    .min_h_0()
                     .overflow_y_scroll()
                     .when(is_empty, |area| {
                         area.child(
                             div()
-                                .px(px(8.0))
+                                .px(px(PAD_X))
                                 .py(px(28.0))
                                 .text_size(px(12.0))
                                 .text_color(rgb(palette::MUTED))
@@ -592,13 +583,26 @@ impl Render for EditorWindow {
                     })
                     .child(list),
             )
-            // 底部
+            // 时间解析失败时在底部给提示，行内保持对齐
+            .when_some(due_error, |area, message| {
+                area.child(
+                    div()
+                        .px(px(PAD_X))
+                        .py(px(6.0))
+                        .border_t_1()
+                        .border_color(rgba(palette::BORDER))
+                        .text_size(px(11.0))
+                        .text_color(rgb(palette::DANGER))
+                        .child(message),
+                )
+            })
+            // 底部操作
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_4()
-                    .px(px(20.0))
+                    .px(px(PAD_X))
                     .py(px(10.0))
                     .border_t_1()
                     .border_color(rgba(palette::BORDER))
@@ -616,7 +620,159 @@ impl Render for EditorWindow {
                         cx.listener(|_, _, window, _cx| window.remove_window()),
                     )),
             )
+            .into_any_element()
     }
+
+    fn render_settings(
+        &mut self,
+        cx: &mut Context<Self>,
+        hotkey: &str,
+        recording: bool,
+        note: Option<String>,
+    ) -> AnyElement {
+        let record_button = if recording {
+            text_link(
+                "hotkey-cancel",
+                "取消",
+                palette::MUTED,
+                cx.listener(|this, _, _window, cx| this.cancel_recording(cx)),
+            )
+        } else {
+            text_link(
+                "hotkey-record",
+                "修改",
+                palette::ACCENT,
+                cx.listener(|this, _, window, cx| this.start_recording(window, cx)),
+            )
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            // 设置项分组标题
+            .child(
+                div()
+                    .px(px(PAD_X))
+                    .pt(px(18.0))
+                    .pb(px(8.0))
+                    .text_size(px(12.0))
+                    .font_semibold()
+                    .child("快捷键"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .px(px(PAD_X))
+                    .py(px(10.0))
+                    .border_t_1()
+                    .border_b_1()
+                    .border_color(rgba(palette::BORDER))
+                    .child(
+                        div()
+                            .w(px(160.0))
+                            .text_size(px(12.0))
+                            .text_color(rgb(palette::MUTED))
+                            .child("唤起 / 收回待办面板"),
+                    )
+                    .child(if recording {
+                        div()
+                            .flex_1()
+                            .text_size(px(12.0))
+                            .text_color(rgb(palette::ACCENT))
+                            .child("按下新的组合键…（Esc 取消）")
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .px(px(7.0))
+                                    .py(px(3.0))
+                                    .rounded(px(4.0))
+                                    .border_1()
+                                    .border_color(rgba(palette::BORDER))
+                                    .bg(rgb(palette::SURFACE))
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(palette::TEXT))
+                                    .child(hotkey.to_string()),
+                            )
+                            .into_any_element()
+                    })
+                    .child(record_button)
+                    .child(text_link(
+                        "hotkey-reset",
+                        "恢复默认",
+                        palette::MUTED,
+                        cx.listener(|this, _, _window, cx| this.reset_hotkey(cx)),
+                    )),
+            )
+            .when_some(note, |section, message| {
+                section.child(
+                    div()
+                        .px(px(PAD_X))
+                        .py(px(6.0))
+                        .text_size(px(11.0))
+                        .text_color(rgb(palette::DANGER))
+                        .child(message),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .px(px(PAD_X))
+                    .py(px(10.0))
+                    .border_t_1()
+                    .border_color(rgba(palette::BORDER))
+                    .child(div().flex_1())
+                    .child(text_link(
+                        "settings-close",
+                        "关闭",
+                        palette::MUTED,
+                        cx.listener(|_, _, window, _cx| window.remove_window()),
+                    )),
+            )
+            .into_any_element()
+    }
+}
+
+/// 顶部页签：选中态用正文色 + 底部 2px 强调色下划线。
+fn tab_button(
+    id: &'static str,
+    label: &'static str,
+    active: bool,
+    cx: &mut Context<EditorWindow>,
+) -> AnyElement {
+    let tab = if label == "待办" { Tab::Todos } else { Tab::Settings };
+    div()
+        .id(id)
+        .pb(px(8.0))
+        .text_size(px(13.0))
+        .when(active, |tab| tab.font_semibold())
+        .text_color(if active {
+            rgb(palette::TEXT)
+        } else {
+            rgb(palette::MUTED)
+        })
+        .border_b_2()
+        .border_color(if active {
+            rgb(palette::ACCENT)
+        } else {
+            rgba(0x00000000)
+        })
+        .child(label)
+        .on_click(cx.listener(move |this, _, _window, cx| this.set_tab(tab, cx)))
+        .into_any_element()
 }
 
 /// 文字按钮：没有框、没有底色，靠颜色和 hover 表达可点击。

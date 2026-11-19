@@ -12,6 +12,8 @@ pub mod win_thread;
 pub enum PlatformEvent {
     /// 托盘「编辑」被点击。
     OpenEditor,
+    /// 托盘「设置」被点击。
+    OpenSettings,
     /// 托盘「收起 / 展开」被点击。
     ToggleWidget,
     /// 全局快捷键：桌面层窗口上浮 / 回落。
