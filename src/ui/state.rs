@@ -35,11 +35,18 @@ impl AppState {
 
     /// 勾选/取消勾选。
     pub fn set_done(&mut self, id: TodoId, done: bool) {
-        if let Some(item) = self.store.item_mut(id) {
-            if item.done == done {
+        match self.store.item_mut(id) {
+            Some(item) => {
+                if item.done == done {
+                    return;
+                }
+                item.done = done;
+                println!("[wasurenai] set_done id={id} done={done}");
+            }
+            None => {
+                eprintln!("[wasurenai] set_done 收到未知 id={id}（元素 id 接错了？）");
                 return;
             }
-            item.done = done;
         }
         self.persist();
     }
@@ -47,20 +54,32 @@ impl AppState {
     /// 点筛选条上的标签（同一个标签再点一次回到「全部」）。
     pub fn toggle_tag_filter(&mut self, tag: &str) {
         self.store.toggle_tag_filter(tag);
+        println!("[wasurenai] tag_filter -> {:?}", self.store.tag_filter);
         self.persist();
     }
 
     pub fn clear_tag_filter(&mut self) {
         if self.store.tag_filter.is_some() {
             self.store.tag_filter = None;
+            println!("[wasurenai] tag_filter -> None");
             self.persist();
         }
     }
 
     /// 立即写盘。写失败只打印，不让 UI 崩（下次修改还会再试）。
     fn persist(&self) {
-        if let Err(err) = self.store.save_to(&self.path) {
-            eprintln!("[wasurenai] 保存 {} 失败：{err}", self.path.display());
+        match self.store.save_to(&self.path) {
+            Ok(()) => println!(
+                "[wasurenai] 已保存（tag_filter={:?} done_ids={:?}）",
+                self.store.tag_filter,
+                self.store
+                    .items
+                    .iter()
+                    .filter(|item| item.done)
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>()
+            ),
+            Err(err) => eprintln!("[wasurenai] 保存 {} 失败：{err}", self.path.display()),
         }
     }
 }
