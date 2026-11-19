@@ -20,8 +20,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Shell::{DefSubclassProc, SUBCLASSPROC, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetShellWindow, GWLP_HWNDPARENT, HWND_BOTTOM, SWP_FRAMECHANGED, SWP_HIDEWINDOW, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WM_WINDOWPOSCHANGING,
-    WINDOWPOS,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SetWindowLongPtrW,
+    SetWindowPos, ShowWindowAsync, WM_WINDOWPOSCHANGING, WINDOWPOS,
 };
 
 static SUBCLASSED: AtomicBool = AtomicBool::new(false);
@@ -29,6 +29,15 @@ static SUBCLASSED: AtomicBool = AtomicBool::new(false);
 const SUBCLASS_ID: usize = 0x57A5_0FA1;
 /// Win+D 会把窗口挪到这个坐标附近来"隐藏"它。
 const HIDDEN_POSITION: i32 = -30000;
+
+/// 显示 / 隐藏窗口（收起展开用）。
+///
+/// 刻意不用"关窗再重建"：重建会重新走 owner 修改 + DirectComposition 建链，
+/// 实测第二个窗口会呈现空白（窗口 Z 序正常、`WindowFromPoint` 也命中它，就是没内容）。
+pub fn set_visible(hwnd: HWND, visible: bool) -> bool {
+    let cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
+    unsafe { ShowWindowAsync(hwnd, cmd).as_bool() }
+}
 
 /// 窗口过程是否成功子类化（供日志/诊断用）。
 pub fn subclassed() -> bool {
@@ -43,7 +52,10 @@ pub fn apply_bottom(hwnd: HWND) -> bool {
             return false;
         }
 
-        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, shell.0 as isize);
+        // 诊断开关（临时）：分离「改 owner」与「强制置底」各自的影响
+        if std::env::var_os("WASURENAI_NO_OWNER").is_none() {
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, shell.0 as isize);
+        }
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_BOTTOM),
@@ -81,8 +93,10 @@ unsafe extern "system" fn bottom_proc(
             }
 
             // 任何置顶/激活请求都压回最底层
-            pos.hwndInsertAfter = HWND_BOTTOM;
-            pos.flags.0 &= !SWP_NOZORDER.0;
+            if std::env::var_os("WASURENAI_NO_BOTTOM").is_none() {
+                pos.hwndInsertAfter = HWND_BOTTOM;
+                pos.flags.0 &= !SWP_NOZORDER.0;
+            }
         }
     }
 

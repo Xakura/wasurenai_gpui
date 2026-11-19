@@ -10,6 +10,12 @@ pub mod win_thread;
 /// 只放"发生了什么"，具体语义（打开编辑器、切换浮层…）由 ui 层解释。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlatformEvent {
+    /// 托盘「编辑」被点击。
+    OpenEditor,
+    /// 托盘「收起 / 展开」被点击。
+    ToggleWidget,
+    /// 全局快捷键：切换置顶浮层。
+    ToggleOverlay,
     /// 托盘「退出」被点击。
     Quit,
 }

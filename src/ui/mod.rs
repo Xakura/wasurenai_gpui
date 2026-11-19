@@ -11,7 +11,10 @@
 //!   而 gpui-component 的 Root 插件会把 surface 背景刷成不透明主题色。桌面层窗口
 //!   用裸 `cx.open_window`。
 
+pub mod editor;
+pub mod overlay;
 pub mod state;
 pub mod theme;
 pub mod widget;
+pub mod widgets;
 pub mod windows;

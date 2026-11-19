@@ -7,3 +7,4 @@ pub mod model;
 pub mod ordering;
 pub mod reminder;
 pub mod store;
+pub mod timeparse;

@@ -8,9 +8,11 @@
 //! 事件通过 `async_channel` 单向送到 gpui 主线程；**所有状态变更只在 gpui 主线程发生**。
 
 use async_channel::Sender;
+use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tray_icon::{
     Icon, TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuItem},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, TranslateMessage,
@@ -43,8 +45,17 @@ pub fn spawn(tx: Sender<PlatformEvent>) {
 
 fn create_tray(tx: Sender<PlatformEvent>) -> anyhow::Result<tray_icon::TrayIcon> {
     let menu = Menu::new();
+    let edit = MenuItem::new("编辑内容", true, None);
+    let toggle = MenuItem::new("收起 / 展开", true, None);
     let quit = MenuItem::new("退出", true, None);
-    menu.append_items(&[&quit])?;
+    menu.append_items(&[
+        &edit,
+        &toggle,
+        &PredefinedMenuItem::separator(),
+        &quit,
+    ])?;
+    let edit_id = edit.id().clone();
+    let toggle_id = toggle.id().clone();
     let quit_id = quit.id().clone();
 
     let tray = TrayIconBuilder::new()
@@ -54,11 +65,78 @@ fn create_tray(tx: Sender<PlatformEvent>) -> anyhow::Result<tray_icon::TrayIcon>
         .build()?;
 
     // 菜单事件在平台线程的消息泵里派发，这里只负责把事件转发出去。
+    let tx_menu = tx.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        if event.id == quit_id {
-            let _ = tx.send_blocking(PlatformEvent::Quit);
+        let mapped = if event.id == edit_id {
+            Some(PlatformEvent::OpenEditor)
+        } else if event.id == toggle_id {
+            Some(PlatformEvent::ToggleWidget)
+        } else if event.id == quit_id {
+            Some(PlatformEvent::Quit)
+        } else {
+            None
+        };
+        if let Some(ev) = mapped {
+            let _ = tx_menu.send_blocking(ev);
         }
     }));
+
+    // ---- 全局热键（失败不致命：可能被别的程序占用了）----
+    let mods = Modifiers::CONTROL | Modifiers::ALT | Modifiers::SHIFT;
+    let overlay_hotkey = HotKey::new(Some(mods), Code::KeyW);
+    let overlay_id = overlay_hotkey.id();
+    // 调试用：WASURENAI_DEBUG=1 时额外注册「收起/展开」，方便无托盘环境验证
+    let widget_hotkey = std::env::var_os("WASURENAI_DEBUG")
+        .is_some()
+        .then(|| HotKey::new(Some(mods), Code::KeyE));
+    let widget_id = widget_hotkey.as_ref().map(|hotkey| hotkey.id());
+
+    let tx_hotkey = tx.clone();
+    GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
+        if event.state != HotKeyState::Pressed {
+            return;
+        }
+        let mapped = if event.id == overlay_id {
+            Some(PlatformEvent::ToggleOverlay)
+        } else if Some(event.id) == widget_id {
+            Some(PlatformEvent::ToggleWidget)
+        } else {
+            None
+        };
+        if let Some(ev) = mapped {
+            let _ = tx_hotkey.send_blocking(ev);
+        }
+    }));
+
+    match GlobalHotKeyManager::new() {
+        Ok(manager) => {
+            let registered = match &widget_hotkey {
+                Some(widget_hotkey) => {
+                    let all = [overlay_hotkey, *widget_hotkey];
+                    match manager.register_all(&all) {
+                        Ok(()) => Some("Ctrl+Alt+Shift+W / Ctrl+Alt+Shift+E（调试）"),
+                        Err(err) => {
+                            eprintln!("[wasurenai] 热键注册失败：{err}");
+                            None
+                        }
+                    }
+                }
+                None => match manager.register(overlay_hotkey) {
+                    Ok(()) => Some("Ctrl+Alt+Shift+W"),
+                    Err(err) => {
+                        eprintln!("[wasurenai] 热键注册失败：{err}");
+                        None
+                    }
+                },
+            };
+            if let Some(list) = registered {
+                println!("[wasurenai] 热键已注册 {list}");
+                // 泄漏到进程结束：注册必须一直有效
+                std::mem::forget(manager);
+            }
+        }
+        Err(err) => eprintln!("[wasurenai] 热键管理器创建失败：{err}"),
+    }
 
     println!("[wasurenai] 托盘就绪");
     Ok(tray)
