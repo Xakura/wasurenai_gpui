@@ -51,6 +51,9 @@ pub struct Store {
     /// 标签筛选，`None` = 全部。
     #[serde(default)]
     pub tag_filter: Option<String>,
+    /// 全局快捷键（规范字符串，如 `Ctrl+Alt+Shift+W`）。`None` = 用默认值。
+    #[serde(default)]
+    pub hotkey: Option<String>,
 }
 
 fn default_next_id() -> TodoId {
@@ -68,6 +71,7 @@ impl Default for Store {
             items: Vec::new(),
             widget_visible: true,
             tag_filter: None,
+            hotkey: None,
         }
     }
 }

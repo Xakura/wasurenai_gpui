@@ -16,6 +16,11 @@ pub enum PlatformEvent {
     ToggleWidget,
     /// 全局快捷键：桌面层窗口上浮 / 回落。
     ToggleFloat,
+    /// 全局快捷键注册结果（换绑后回报给 UI）。
+    HotkeyChanged {
+        spec: String,
+        error: Option<String>,
+    },
     /// 托盘「退出」被点击。
     Quit,
 }

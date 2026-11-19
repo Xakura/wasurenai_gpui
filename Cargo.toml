@@ -20,6 +20,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Controls",
+    "Win32_System_Threading",
 ] }
 tray-icon = "0.26"
 global-hotkey = "0.10"

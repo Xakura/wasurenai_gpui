@@ -24,6 +24,7 @@ fn main() {
             .detach();
 
             let state = cx.new(|_| ui::state::AppState::load());
+            let initial_hotkey = state.read(cx).hotkey();
 
             // 平台线程 → gpui 主线程：这里只做窗口/应用级操作，
             // 数据变更交给 entity（分开处理，避免 entity 重入 lease）。
@@ -39,6 +40,17 @@ fn main() {
                         }
                         platform::PlatformEvent::ToggleFloat => {
                             cx.update(|app| ui::windows::toggle_float(app, pump_state.clone()));
+                        }
+                        platform::PlatformEvent::HotkeyChanged { spec, error } => {
+                            let (spec, error) = (spec.clone(), error.clone());
+                            println!(
+                                "[wasurenai] 快捷键 {spec} -> {}",
+                                error.as_deref().unwrap_or("已生效")
+                            );
+                            pump_state.update(cx, |app, cx| {
+                                app.hotkey_error = error;
+                                cx.notify();
+                            });
                         }
                         platform::PlatformEvent::Quit => {
                             println!("[wasurenai] 收到退出请求（托盘）");
@@ -62,7 +74,7 @@ fn main() {
             });
             tick_task.detach();
 
-            platform::win_thread::spawn(tx);
+            platform::win_thread::spawn(tx, initial_hotkey);
 
             // 启动一律展开：上次是收起状态也开，避免用户下次启动看不到面板以为坏了。
             // （widget_visible 仍然记录/落盘，只是不作为启动条件。）

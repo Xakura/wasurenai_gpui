@@ -16,6 +16,7 @@ use chrono::NaiveDateTime;
 // 与下方测试模块里的 `#[test]` 属性宏打架（recursion limit reached）。
 use gpui_kit::Context;
 
+use crate::core::hotkey::HotkeySpec;
 use crate::core::model::{Store, TodoId, TodoItem, normalize_tag};
 use crate::core::{reminder, store};
 
@@ -28,6 +29,8 @@ pub struct AppState {
     acked: HashSet<TodoId>,
     /// 用户是否用快捷键把窗口浮到了最上层（不持久化）。
     pub user_floated: bool,
+    /// 最近一次快捷键注册失败的提示（不持久化）。
+    pub hotkey_error: Option<String>,
 }
 
 impl AppState {
@@ -39,6 +42,7 @@ impl AppState {
             save_generation: 0,
             acked: HashSet::new(),
             user_floated: false,
+            hotkey_error: None,
         }
     }
 
@@ -50,6 +54,7 @@ impl AppState {
             save_generation: 0,
             acked: HashSet::new(),
             user_floated: false,
+            hotkey_error: None,
         }
     }
 
@@ -154,6 +159,41 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    // ---- 全局快捷键 ----
+
+    /// 当前生效的快捷键（存盘值非法时回落到默认）。
+    pub fn hotkey(&self) -> HotkeySpec {
+        self.store
+            .hotkey
+            .as_deref()
+            .and_then(|raw| HotkeySpec::parse(raw).ok())
+            .unwrap_or_else(HotkeySpec::default_spec)
+    }
+
+    /// 设置快捷键（`None` = 恢复默认）。非法输入返回 false 并给出原因。
+    pub fn set_hotkey(&mut self, raw: &str) -> Result<HotkeySpec, String> {
+        let spec = HotkeySpec::parse(raw)?;
+        let canonical = spec.format();
+        if self.store.hotkey.as_deref() == Some(canonical.as_str()) {
+            return Ok(spec);
+        }
+        self.store.hotkey = if canonical == crate::core::hotkey::DEFAULT {
+            None
+        } else {
+            Some(canonical.clone())
+        };
+        println!("[wasurenai] hotkey -> {canonical}");
+        self.hotkey_error = None;
+        Ok(spec)
+    }
+
+    pub fn reset_hotkey(&mut self) -> HotkeySpec {
+        self.store.hotkey = None;
+        println!("[wasurenai] hotkey -> 默认");
+        self.hotkey_error = None;
+        HotkeySpec::default_spec()
     }
 
     // ---- 到期提醒 ----

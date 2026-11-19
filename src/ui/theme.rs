@@ -41,6 +41,8 @@ pub mod editor {
     pub const MUTED: u32 = 0x71717a;
     /// 半透明分隔线。
     pub const BORDER: u32 = 0x00000014;
+    /// 行 hover 底色。
+    pub const HOVER: u32 = 0x00000008;
     /// 强调色（与面板同一个蓝）。
     pub const ACCENT: u32 = 0x2f6feb;
     /// 校验错误。
