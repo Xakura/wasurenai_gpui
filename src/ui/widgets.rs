@@ -22,11 +22,11 @@ pub fn tick_box(
         .rounded(px(4.0))
         .border_1()
         .border_color(if done {
-            rgba(panel::ACCENT)
+            rgb(panel::ACCENT)
         } else {
             rgba(panel::BORDER)
         })
-        .when(done, |box_| box_.bg(rgba(panel::ACCENT)))
+        .when(done, |box_| box_.bg(rgb(panel::ACCENT)))
         .flex()
         .items_center()
         .justify_center()

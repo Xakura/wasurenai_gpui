@@ -16,7 +16,7 @@ use windows::Win32::Foundation::{LPARAM, WPARAM};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tray_icon::{
-    Icon, TrayIconBuilder,
+    TrayIconBuilder,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::core::hotkey::HotkeySpec;
-use crate::platform::PlatformEvent;
+use crate::platform::{PlatformEvent, icon};
 
 /// 唤醒消息泵用的自定义消息。
 const WM_APP_COMMAND: u32 = WM_APP + 1;
@@ -40,6 +40,16 @@ static PUMP_THREAD: OnceLock<u32> = OnceLock::new();
 pub enum PlatformCommand {
     /// 重新注册全局快捷键。
     SetHotkey(HotkeySpec),
+    /// 录制快捷键期间临时注销旧热键，避免按下原组合键时误触上浮。
+    PauseHotkey,
+    /// 取消录制后恢复原先的全局快捷键。
+    ResumeHotkey,
+    /// 同步托盘提示、图标状态与「收起 / 展开」菜单文案。
+    UpdateTray {
+        pending: usize,
+        overdue: usize,
+        widget_visible: bool,
+    },
 }
 
 /// 给平台线程发命令（必要时先启动它）。返回是否成功唤醒。
@@ -58,8 +68,13 @@ pub fn send_command(cmd: PlatformCommand) -> bool {
 /// 命令队列（创建一次，供任意线程投递）。
 static COMMAND_QUEUE: OnceLock<Sender<PlatformCommand>> = OnceLock::new();
 
-/// 启动平台线程。`initial_hotkey` 启动时就注册。
-pub fn spawn(tx: Sender<PlatformEvent>, initial_hotkey: HotkeySpec) {
+/// 启动平台线程。`initial_hotkey` / `initial_pending` / `initial_overdue` 用于首帧初始化托盘与热键。
+pub fn spawn(
+    tx: Sender<PlatformEvent>,
+    initial_hotkey: HotkeySpec,
+    initial_pending: usize,
+    initial_overdue: usize,
+) {
     let (command_tx, command_rx) = async_channel::unbounded();
     let _ = COMMAND_QUEUE.set(command_tx);
 
@@ -67,13 +82,14 @@ pub fn spawn(tx: Sender<PlatformEvent>, initial_hotkey: HotkeySpec) {
         .name("wasurenai-platform".into())
         .spawn(move || unsafe {
             // 托盘图标必须活到消息泵结束：一旦 drop，图标就从托盘里消失了。
-            let _tray = match create_tray(tx.clone()) {
-                Ok(tray) => Some(tray),
+            let tray_bundle = match create_tray(tx.clone(), initial_pending, initial_overdue) {
+                Ok(bundle) => Some(bundle),
                 Err(err) => {
                     eprintln!("[wasurenai] 托盘创建失败：{err:#}");
                     None
                 }
             };
+            let mut last_icon_state = (initial_pending > 0, initial_overdue > 0);
 
             let mut hotkeys = Hotkeys::new(tx.clone());
             hotkeys.apply(initial_hotkey);
@@ -91,6 +107,26 @@ pub fn spawn(tx: Sender<PlatformEvent>, initial_hotkey: HotkeySpec) {
                     while let Ok(command) = command_rx.try_recv() {
                         match command {
                             PlatformCommand::SetHotkey(spec) => hotkeys.apply(spec),
+                            PlatformCommand::PauseHotkey => hotkeys.pause(),
+                            PlatformCommand::ResumeHotkey => hotkeys.resume(),
+                            PlatformCommand::UpdateTray {
+                                pending,
+                                overdue,
+                                widget_visible,
+                            } => {
+                                if let Some((ref tray, ref toggle_item)) = tray_bundle {
+                                    let tip = format_tooltip(pending, overdue);
+                                    let _ = tray.set_tooltip(Some(&tip));
+                                    toggle_item.set_text(toggle_label(widget_visible));
+                                    let next_icon_state = (pending > 0, overdue > 0);
+                                    if next_icon_state != last_icon_state {
+                                        let _ = tray.set_icon(Some(icon::tray_icon(
+                                            pending, overdue,
+                                        )));
+                                        last_icon_state = next_icon_state;
+                                    }
+                                }
+                            }
                         }
                     }
                     continue;
@@ -111,6 +147,7 @@ struct Hotkeys {
     /// 创建失败时为 None：热键用不了，但托盘还得工作。
     manager: Option<GlobalHotKeyManager>,
     current: Option<HotKey>,
+    saved_spec: Option<HotkeySpec>,
     tx: Sender<PlatformEvent>,
 }
 
@@ -137,11 +174,29 @@ impl Hotkeys {
         Self {
             manager,
             current: None,
+            saved_spec: None,
             tx,
         }
     }
 
+    fn pause(&mut self) {
+        if let (Some(manager), Some(old)) = (&self.manager, self.current.take()) {
+            let _ = manager.unregister(old);
+        }
+        CURRENT_ID.store(0, Ordering::Relaxed);
+    }
+
+    fn resume(&mut self) {
+        if self.current.is_some() {
+            return;
+        }
+        if let Some(spec) = self.saved_spec.clone() {
+            self.apply(spec);
+        }
+    }
+
     fn apply(&mut self, spec: HotkeySpec) {
+        self.saved_spec = Some(spec.clone());
         let Some(manager) = &self.manager else {
             self.report(spec, Err("热键管理器不可用".into()));
             return;
@@ -269,11 +324,15 @@ fn key_code(key: &str) -> Option<Code> {
     Some(code)
 }
 
-fn create_tray(tx: Sender<PlatformEvent>) -> anyhow::Result<tray_icon::TrayIcon> {
+fn create_tray(
+    tx: Sender<PlatformEvent>,
+    initial_pending: usize,
+    initial_overdue: usize,
+) -> anyhow::Result<(tray_icon::TrayIcon, MenuItem)> {
     let menu = Menu::new();
-    let edit = MenuItem::new("编辑内容", true, None);
+    let edit = MenuItem::new("编辑待办", true, None);
     let settings = MenuItem::new("设置", true, None);
-    let toggle = MenuItem::new("收起 / 展开", true, None);
+    let toggle = MenuItem::new(toggle_label(true), true, None);
     let quit = MenuItem::new("退出", true, None);
     menu.append_items(&[
         &edit,
@@ -289,8 +348,8 @@ fn create_tray(tx: Sender<PlatformEvent>) -> anyhow::Result<tray_icon::TrayIcon>
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("wasurenai")
-        .with_icon(app_icon())
+        .with_tooltip(format_tooltip(initial_pending, initial_overdue))
+        .with_icon(icon::tray_icon(initial_pending, initial_overdue))
         .build()?;
 
     // 菜单事件在平台线程的消息泵里派发，这里只负责把事件转发出去。
@@ -313,23 +372,40 @@ fn create_tray(tx: Sender<PlatformEvent>) -> anyhow::Result<tray_icon::TrayIcon>
     }));
 
     println!("[wasurenai] 托盘就绪");
-    Ok(tray)
+    Ok((tray, toggle))
 }
 
-/// 临时的纯色方块图标（M5 换成正式图标）。
-fn app_icon() -> Icon {
-    const SIZE: u32 = 32;
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let inner = x > 4 && x < 27 && y > 4 && y < 27;
-            let (r, g, b) = if inner {
-                (0x5b, 0xc4, 0xff)
-            } else {
-                (0x1e, 0x6f, 0xd9)
-            };
-            rgba.extend_from_slice(&[r, g, b, 0xff]);
-        }
+fn format_tooltip(pending: usize, overdue: usize) -> String {
+    if overdue > 0 {
+        format!("Wasurenai · {pending} 项未完成（{overdue} 项已逾期）")
+    } else if pending > 0 {
+        format!("Wasurenai · {pending} 项未完成")
+    } else {
+        "Wasurenai · 全部已完成".to_string()
     }
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("内置图标数据合法")
+}
+
+fn toggle_label(widget_visible: bool) -> &'static str {
+    if widget_visible {
+        "收起面板"
+    } else {
+        "展开面板"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_tooltip_and_toggle_label_reflect_counts() {
+        assert_eq!(format_tooltip(0, 0), "Wasurenai · 全部已完成");
+        assert_eq!(format_tooltip(3, 0), "Wasurenai · 3 项未完成");
+        assert_eq!(
+            format_tooltip(4, 2),
+            "Wasurenai · 4 项未完成（2 项已逾期）"
+        );
+        assert_eq!(toggle_label(true), "收起面板");
+        assert_eq!(toggle_label(false), "展开面板");
+    }
 }

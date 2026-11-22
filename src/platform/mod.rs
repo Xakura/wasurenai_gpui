@@ -2,6 +2,9 @@
 //!
 //! 依赖方向：ui → platform，platform 不依赖 core / ui。
 
+pub mod autostart;
+pub mod icon;
+pub mod single_instance;
 pub mod win_layer;
 pub mod win_thread;
 

@@ -25,6 +25,8 @@ pub struct AppState {
     path: PathBuf,
     /// 防抖落盘用：每次修改自增，只有最新一代的定时任务会真正写盘。
     save_generation: u64,
+    /// 是否有尚未落盘的防抖修改（退出或关窗时用 `flush_save` 强制写回）。
+    dirty: bool,
     /// 本次运行里已经点过「知道了」的提醒项（不持久化：重启后逾期项会再提醒一次）。
     acked: HashSet<TodoId>,
     /// 用户是否用快捷键把窗口浮到了最上层（不持久化）。
@@ -40,6 +42,7 @@ impl AppState {
             store: store::load(),
             path: store::data_path(),
             save_generation: 0,
+            dirty: false,
             acked: HashSet::new(),
             user_floated: false,
             hotkey_error: None,
@@ -52,6 +55,7 @@ impl AppState {
             store: store::load_from(&path),
             path,
             save_generation: 0,
+            dirty: false,
             acked: HashSet::new(),
             user_floated: false,
             hotkey_error: None,
@@ -134,6 +138,20 @@ impl AppState {
         Some(id)
     }
 
+    /// 一次性创建带截止时间和标签的新待办。空白文本返回 `None`。
+    pub fn add_item_full(
+        &mut self,
+        text: &str,
+        due: Option<NaiveDateTime>,
+        tag: Option<&str>,
+    ) -> Option<TodoId> {
+        let id = self.store.add(text)?;
+        self.store.set_due(id, due);
+        self.store.set_tag(id, tag);
+        println!("[wasurenai] add_item_full id={id} due={due:?}");
+        Some(id)
+    }
+
     pub fn remove_item(&mut self, id: TodoId) -> bool {
         if self.store.remove(id) {
             self.store.prune_tag_filter();
@@ -143,6 +161,25 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    /// 清除所有已完成的待办，返回清理条数。
+    pub fn clear_completed(&mut self) -> usize {
+        let mut removed = 0;
+        self.store.items.retain(|item| {
+            if item.done {
+                self.acked.remove(&item.id);
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if removed > 0 {
+            self.store.prune_tag_filter();
+            println!("[wasurenai] clear_completed count={removed}");
+        }
+        removed
     }
 
     pub fn toggle_tag_filter(&mut self, tag: &str) -> bool {
@@ -244,6 +281,7 @@ impl AppState {
 
     /// 防抖落盘：350ms 内的连续修改只写一次；写完再通知观察者刷新。
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        self.dirty = true;
         self.save_generation += 1;
         let generation = self.save_generation;
         cx.spawn(async move |this, cx| {
@@ -261,19 +299,31 @@ impl AppState {
         .detach();
     }
 
+    /// 立即刷盘未保存的防抖改动（关窗或退出前调用，避免最后 350ms 内的编辑丢失）。
+    pub fn flush_save(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.save_generation += 1;
+        self.persist_now();
+    }
+
     /// 立即写盘。写失败只打印，不让 UI 崩（下次修改还会再试）。
-    pub fn persist_now(&self) {
+    pub fn persist_now(&mut self) {
         match self.store.save_to(&self.path) {
-            Ok(()) => println!(
-                "[wasurenai] 已保存（tag_filter={:?} done_ids={:?}）",
-                self.store.tag_filter,
-                self.store
-                    .items
-                    .iter()
-                    .filter(|item| item.done)
-                    .map(|item| item.id)
-                    .collect::<Vec<_>>()
-            ),
+            Ok(()) => {
+                self.dirty = false;
+                println!(
+                    "[wasurenai] 已保存（tag_filter={:?} done_ids={:?}）",
+                    self.store.tag_filter,
+                    self.store
+                        .items
+                        .iter()
+                        .filter(|item| item.done)
+                        .map(|item| item.id)
+                        .collect::<Vec<_>>()
+                );
+            }
             Err(err) => eprintln!("[wasurenai] 保存 {} 失败：{err}", self.path.display()),
         }
     }
@@ -433,5 +483,57 @@ mod tests {
             state.due_items(dt(19, 12)).is_empty(),
             "勾选完成等价于确认提醒"
         );
+    }
+
+    #[test]
+    fn add_item_full_sets_due_and_tag() {
+        let (_dir, path) = TempDir::new();
+        let mut state = AppState::load_from(path);
+        let id = state
+            .add_item_full("  提交季报 ", Some(dt(21, 18)), Some("#工作"))
+            .expect("应成功创建");
+        let item = state.store.item(id).unwrap();
+        assert_eq!(item.text, "提交季报");
+        assert_eq!(item.due, Some(dt(21, 18)));
+        assert_eq!(item.tag.as_deref(), Some("工作"));
+
+        assert_eq!(state.add_item_full("   ", Some(dt(21, 18)), None), None);
+    }
+
+    #[test]
+    fn clear_completed_removes_only_done() {
+        let (_dir, path) = TempDir::new();
+        let mut state = AppState::load_from(path);
+        let keep = state.add_item("未完成").unwrap();
+        let done_one = state.add_item("已完成1").unwrap();
+        let done_two = state.add_item("已完成2").unwrap();
+        state.set_tag(done_one, Some("工作"));
+        state.store.tag_filter = Some("工作".into());
+        state.set_done(done_one, true);
+        state.set_done(done_two, true);
+
+        let cleared = state.clear_completed();
+        assert_eq!(cleared, 2);
+        assert!(state.store.item(keep).is_some());
+        assert!(state.store.item(done_one).is_none());
+        assert!(state.store.item(done_two).is_none());
+        assert_eq!(state.store.tag_filter, None, "被删标签使用为空后应清理筛选");
+        assert_eq!(state.clear_completed(), 0);
+    }
+
+    #[test]
+    fn flush_save_writes_pending_dirty_state() {
+        let (_dir, path) = TempDir::new();
+        let mut state = AppState::load_from(path.clone());
+        let id = state.add_item("刷盘测试").unwrap();
+
+        state.flush_save();
+        assert!(!path.exists(), "非 dirty 状态 flush 不应多余写盘");
+
+        state.dirty = true;
+        state.flush_save();
+        assert!(!state.dirty);
+        let reloaded = store::load_from(&path);
+        assert_eq!(reloaded.item(id).unwrap().text, "刷盘测试");
     }
 }

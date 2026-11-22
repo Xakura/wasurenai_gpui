@@ -13,19 +13,26 @@
 //!
 //! 已知限制：Explorer 重启会连带销毁被 owner 的窗口（见 docs/plan.md 风险表）。
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY,
+    DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmSetWindowAttribute,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, SUBCLASSPROC, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetShellWindow, GWLP_HWNDPARENT, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED,
-    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, SetWindowLongPtrW, SetWindowPos, ShowWindowAsync, WM_WINDOWPOSCHANGING,
-    WINDOWPOS,
+    GWL_EXSTYLE, GWLP_HWNDPARENT, GetShellWindow, GetWindowLongPtrW, HWND_BOTTOM, HWND_NOTOPMOST,
+    HWND_TOPMOST, IsWindowVisible, RegisterWindowMessageW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WINDOWPOS, WM_WINDOWPOSCHANGING, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
+use windows::core::{BOOL, w};
 
 static SUBCLASSED: AtomicBool = AtomicBool::new(false);
 static LAYER: AtomicU8 = AtomicU8::new(Layer::Bottom as u8);
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 const SUBCLASS_ID: usize = 0x57A5_0FA1;
 /// Win+D 会把窗口挪到这个坐标附近来"隐藏"它。
@@ -52,9 +59,15 @@ pub fn subclassed() -> bool {
     SUBCLASSED.load(Ordering::Relaxed)
 }
 
-/// 接管窗口：设 owner、子类化、压到桌面层。返回是否完全成功。
+/// 接管窗口：清掉任务栏属性、设 owner、子类化、压到桌面层。返回是否完全成功。
 pub fn attach(hwnd: HWND) -> bool {
     unsafe {
+        let tc = RegisterWindowMessageW(w!("TaskbarCreated"));
+        TASKBAR_CREATED.store(tc, Ordering::Relaxed);
+
+        ensure_tool_window(hwnd);
+        disable_dwm_frame(hwnd);
+
         let shell = GetShellWindow();
         if shell.is_invalid() {
             return false;
@@ -71,6 +84,58 @@ pub fn attach(hwnd: HWND) -> bool {
     }
 }
 
+/// 兜底去掉 `WS_EX_APPWINDOW` 并加上 `WS_EX_TOOLWINDOW`，确保不进任务栏与 Alt+Tab。
+unsafe fn ensure_tool_window(hwnd: HWND) {
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let desired = (ex & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0;
+        if desired != ex {
+            let visible = IsWindowVisible(hwnd).as_bool();
+            if visible {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired as isize);
+            if visible {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
+    }
+}
+
+/// 禁用 Win11 DWM 默认圆角、系统边框、非客户区渲染与内置显隐过渡，避免叠出四角灰框或与 GPUI 动效冲突。
+unsafe fn disable_dwm_frame(hwnd: HWND) {
+    unsafe {
+        let corner = DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const corner).cast(),
+            std::mem::size_of_val(&corner) as u32,
+        );
+        let border = DWMWA_COLOR_NONE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&raw const border).cast(),
+            std::mem::size_of_val(&border) as u32,
+        );
+        let ncrp = DWMNCRP_DISABLED;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            (&raw const ncrp).cast(),
+            std::mem::size_of_val(&ncrp) as u32,
+        );
+        let disable_transitions = BOOL(1);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            (&raw const disable_transitions).cast(),
+            std::mem::size_of_val(&disable_transitions) as u32,
+        );
+    }
+}
+
 /// 切换层级。`Top` 时窗口浮到最上层，`Bottom` 时压回桌面层。
 pub fn set_layer(hwnd: HWND, layer: Layer) -> bool {
     LAYER.store(layer as u8, Ordering::Relaxed);
@@ -78,27 +143,10 @@ pub fn set_layer(hwnd: HWND, layer: Layer) -> bool {
     unsafe {
         let no_activate = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
         match layer {
-            Layer::Top => SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                no_activate | SWP_FRAMECHANGED,
-            )
-            .is_ok(),
+            Layer::Top => SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, no_activate).is_ok(),
             Layer::Bottom => {
                 let normal = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, no_activate);
-                let bottom = SetWindowPos(
-                    hwnd,
-                    Some(HWND_BOTTOM),
-                    0,
-                    0,
-                    0,
-                    0,
-                    no_activate | SWP_FRAMECHANGED,
-                );
+                let bottom = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, no_activate);
                 normal.is_ok() && bottom.is_ok()
             }
         }
@@ -107,10 +155,13 @@ pub fn set_layer(hwnd: HWND, layer: Layer) -> bool {
 
 /// 显示 / 隐藏窗口（收起展开用）。
 ///
-/// 刻意不用"关窗再重建"：重建要重新走 owner 修改 + DirectComposition 建链，成本高且脆弱。
+/// 使用同步 `ShowWindow`，确保展开动画首帧开始时窗口句柄已处于可见状态。
 pub fn set_visible(hwnd: HWND, visible: bool) -> bool {
     let cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
-    unsafe { ShowWindowAsync(hwnd, cmd).as_bool() }
+    unsafe {
+        let _ = ShowWindow(hwnd, cmd);
+        IsWindowVisible(hwnd).as_bool() == visible
+    }
 }
 
 unsafe extern "system" fn layer_proc(
@@ -121,6 +172,21 @@ unsafe extern "system" fn layer_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    // Explorer 重启后会广播 TaskbarCreated：重新把 owner 挂回新的 Progman 并恢复层级
+    let tc = TASKBAR_CREATED.load(Ordering::Relaxed);
+    if tc != 0 && msg == tc {
+        unsafe {
+            disable_dwm_frame(hwnd);
+            let shell = GetShellWindow();
+            if !shell.is_invalid() {
+                SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, shell.0 as isize);
+            }
+        }
+        let layer = current_layer();
+        let ok = set_layer(hwnd, layer);
+        println!("[wasurenai] Explorer 重启后恢复桌面层 owner 与层级={layer:?} ok={ok}");
+    }
+
     // 只有置于桌面层时才需要拦消息：置顶状态下让系统正常处理。
     if msg == WM_WINDOWPOSCHANGING && current_layer() == Layer::Bottom {
         let pos = lparam.0 as *mut WINDOWPOS;
