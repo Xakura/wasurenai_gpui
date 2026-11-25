@@ -8,9 +8,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use chrono::NaiveDateTime;
+use chrono::{Local, NaiveDate, NaiveDateTime};
 
-use crate::core::model::{Store, TodoId, TodoItem, normalize_tag};
+use crate::core::model::{Store, TodoId, TodoItem, normalize_tag, normalize_tags};
+use crate::core::ordering;
 
 /// 数据文件路径：`%APPDATA%\wasurenai_gpui\todos.json`。
 ///
@@ -35,8 +36,22 @@ pub fn load_from(path: &Path) -> Store {
         }
     };
 
+    let has_predefined_key = text.contains("\"predefined_tags\"");
     match serde_json::from_str::<Store>(&text) {
-        Ok(store) => store,
+        Ok(mut store) => {
+            store.predefined_tags = normalize_tags(store.predefined_tags);
+            // 旧版 JSON 没有 predefined_tags 字段：把已有待办上的标签自动吸收为预定义标签，避免升级后标签选项为空。
+            if !has_predefined_key {
+                for item in &store.items {
+                    for tag in &item.tags {
+                        if !store.predefined_tags.contains(tag) {
+                            store.predefined_tags.push(tag.clone());
+                        }
+                    }
+                }
+            }
+            store
+        }
         Err(err) => {
             let backup = path.with_extension("json.bak");
             eprintln!(
@@ -78,15 +93,20 @@ impl Store {
         self.items.iter_mut().find(|item| item.id == id)
     }
 
-    /// 新增一条待办，返回新 id。空白文本会被拒绝（返回 None）。
+    /// 新增一条待办（自动写入当前本地建立时间），返回新 id。空白文本会被拒绝（返回 None）。
     pub fn add(&mut self, text: impl AsRef<str>) -> Option<TodoId> {
+        self.add_at(text, Local::now().naive_local())
+    }
+
+    /// 新增一条待办并指定建立时间（便于确定性单测）。
+    pub fn add_at(&mut self, text: impl AsRef<str>, now: NaiveDateTime) -> Option<TodoId> {
         let text = text.as_ref().trim();
         if text.is_empty() {
             return None;
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.items.push(TodoItem::new(id, text));
+        self.items.push(TodoItem::new_at(id, text, now));
         Some(id)
     }
 
@@ -96,10 +116,24 @@ impl Store {
         self.items.len() != before
     }
 
-    /// 切换完成状态；勾选完成时保留 due（历史信息）。
+    /// 切换完成状态；勾选完成时记录完成时间并保留 due，取消完成时清空完成时间。
     pub fn toggle(&mut self, id: TodoId) {
+        let now = Local::now().naive_local();
         if let Some(item) = self.item_mut(id) {
             item.done = !item.done;
+            item.completed_at = if item.done { Some(now) } else { None };
+        }
+    }
+
+    /// 显式设置完成状态与完成时间。返回值表示是否有变化。
+    pub fn set_done_at(&mut self, id: TodoId, done: bool, now: NaiveDateTime) -> bool {
+        match self.item_mut(id) {
+            Some(item) if item.done != done => {
+                item.done = done;
+                item.completed_at = if done { Some(now) } else { None };
+                true
+            }
+            _ => false,
         }
     }
 
@@ -119,15 +153,58 @@ impl Store {
         }
     }
 
-    /// 设置标签，空白或纯 `#` 视为清除标签。
-    pub fn set_tag(&mut self, id: TodoId, tag: Option<&str>) {
-        let normalized = tag.and_then(normalize_tag);
-        if let Some(item) = self.item_mut(id) {
-            item.tag = normalized;
+    /// 整组设置多标签（自动规范化与去重）。
+    pub fn set_tags<I, S>(&mut self, id: TodoId, tags: I) -> bool
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let normalized = normalize_tags(tags);
+        match self.item_mut(id) {
+            Some(item) if item.tags != normalized => {
+                item.tags = normalized;
+                true
+            }
+            _ => false,
         }
     }
 
-    /// 切换标签筛选：同标签再点一次回到「全部」。筛选的标签已不存在时也回到全部。
+    /// 勾选/取消单条待办上的某个标签。返回值表示是否有变化。
+    pub fn toggle_item_tag(&mut self, id: TodoId, raw_tag: &str) -> bool {
+        let Some(tag) = normalize_tag(raw_tag) else {
+            return false;
+        };
+        let Some(item) = self.item_mut(id) else {
+            return false;
+        };
+        if let Some(pos) = item.tags.iter().position(|t| t == &tag) {
+            item.tags.remove(pos);
+        } else {
+            item.tags.push(tag);
+        }
+        true
+    }
+
+    /// 新增预定义工作标签（规范化并去重）。返回值表示是否真正新增。
+    pub fn add_predefined_tag(&mut self, raw: &str) -> bool {
+        let Some(tag) = normalize_tag(raw) else {
+            return false;
+        };
+        if self.predefined_tags.contains(&tag) {
+            return false;
+        }
+        self.predefined_tags.push(tag);
+        true
+    }
+
+    /// 删除预定义工作标签（仅从预设列表移除，不修改历史待办上的已记录标签）。
+    pub fn remove_predefined_tag(&mut self, tag: &str) -> bool {
+        let before = self.predefined_tags.len();
+        self.predefined_tags.retain(|t| t != tag);
+        self.predefined_tags.len() != before
+    }
+
+    /// 切换标签筛选：同标签再点一次回到「全部」。
     pub fn toggle_tag_filter(&mut self, tag: &str) {
         self.tag_filter = match self.tag_filter.as_deref() {
             Some(current) if current == tag => None,
@@ -135,24 +212,29 @@ impl Store {
         };
     }
 
-    /// 筛选的标签不再被任何条目使用时，清掉筛选，避免界面卡在空列表。
-    pub fn prune_tag_filter(&mut self) {
+    /// 筛选的标签不再被任何当日可见条目使用时，清掉筛选，避免界面卡在空列表。
+    pub fn prune_tag_filter_on(&mut self, today: NaiveDate) {
         if let Some(filter) = self.tag_filter.clone() {
             let still_used = self
                 .items
                 .iter()
-                .any(|item| item.tag.as_deref() == Some(filter.as_str()));
+                .filter(|item| ordering::is_visible_on(item, today))
+                .any(|item| item.has_tag(&filter));
             if !still_used {
                 self.tag_filter = None;
             }
         }
+    }
+
+    /// 以今天为基准清理失效标签筛选。
+    pub fn prune_tag_filter(&mut self) {
+        self.prune_tag_filter_on(Local::now().date_naive());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -193,7 +275,10 @@ mod tests {
     #[test]
     fn data_path_points_to_appdata_dir() {
         let path = data_path();
-        assert!(path.ends_with("wasurenai_gpui/todos.json") || path.ends_with("wasurenai_gpui\\todos.json"));
+        assert!(
+            path.ends_with("wasurenai_gpui/todos.json")
+                || path.ends_with("wasurenai_gpui\\todos.json")
+        );
     }
 
     #[test]
@@ -207,17 +292,45 @@ mod tests {
     fn save_then_load_round_trip() {
         let dir = TempDir::new("roundtrip");
         let mut store = Store::default();
-        let id = store.add("交周报").expect("id");
+        store.add_predefined_tag("工作");
+        store.add_predefined_tag("研发");
+        let id = store.add_at("交周报", dt(20, 9)).expect("id");
         store.set_due(id, Some(dt(20, 18)));
-        store.set_tag(id, Some("#工作"));
+        store.set_tags(id, ["#工作", "研发"]);
         store.widget_visible = false;
 
         store.save_to(&dir.file()).expect("save");
         let loaded = load_from(&dir.file());
 
         assert_eq!(loaded, store);
-        assert_eq!(loaded.item(id).unwrap().tag.as_deref(), Some("工作"));
-        assert!(!dir.file().with_extension("json.tmp").exists(), "临时文件应已 rename");
+        assert_eq!(
+            loaded.item(id).unwrap().tags,
+            vec!["工作".to_string(), "研发".to_string()]
+        );
+        assert_eq!(loaded.item(id).unwrap().created_at, Some(dt(20, 9)));
+        assert!(
+            !dir.file().with_extension("json.tmp").exists(),
+            "临时文件应已 rename"
+        );
+    }
+
+    #[test]
+    fn legacy_file_absorbs_tags_into_predefined_once() {
+        let dir = TempDir::new("legacy_absorb");
+        fs::write(
+            dir.file(),
+            r#"{ "items": [ { "id": 1, "text": "旧任务", "tag": "工作" } ] }"#,
+        )
+        .unwrap();
+
+        let mut store = load_from(&dir.file());
+        assert_eq!(store.predefined_tags, vec!["工作".to_string()]);
+
+        // 用户手动删除预定义标签并保存后，再次加载不应复活
+        assert!(store.remove_predefined_tag("工作"));
+        store.save_to(&dir.file()).unwrap();
+        let reloaded = load_from(&dir.file());
+        assert!(reloaded.predefined_tags.is_empty());
     }
 
     #[test]
@@ -234,13 +347,14 @@ mod tests {
     }
 
     #[test]
-    fn add_assigns_increasing_ids_and_rejects_blank() {
+    fn add_assigns_increasing_ids_and_created_at_and_rejects_blank() {
         let mut store = Store::default();
-        let first = store.add("a").unwrap();
-        let second = store.add("b").unwrap();
+        let first = store.add_at("a", dt(25, 10)).unwrap();
+        let second = store.add_at("b", dt(25, 11)).unwrap();
 
         assert_eq!((first, second), (1, 2));
         assert_eq!(store.next_id, 3);
+        assert_eq!(store.item(first).unwrap().created_at, Some(dt(25, 10)));
         assert_eq!(store.add("   "), None, "空白文本不应生成条目");
         assert_eq!(store.items.len(), 2);
     }
@@ -256,18 +370,21 @@ mod tests {
     }
 
     #[test]
-    fn toggle_flips_done_and_keeps_due() {
+    fn set_done_at_tracks_completed_timestamp_and_keeps_due() {
         let mut store = Store::default();
-        let id = store.add("a").unwrap();
+        let id = store.add_at("a", dt(20, 9)).unwrap();
         store.set_due(id, Some(dt(20, 18)));
 
-        store.toggle(id);
+        assert!(store.set_done_at(id, true, dt(20, 15)));
         let item = store.item(id).unwrap();
         assert!(item.done);
         assert_eq!(item.due, Some(dt(20, 18)));
+        assert_eq!(item.completed_at, Some(dt(20, 15)));
 
-        store.toggle(id);
-        assert!(!store.item(id).unwrap().done);
+        assert!(store.set_done_at(id, false, dt(20, 16)));
+        let item = store.item(id).unwrap();
+        assert!(!item.done);
+        assert_eq!(item.completed_at, None);
     }
 
     #[test]
@@ -283,18 +400,29 @@ mod tests {
     }
 
     #[test]
-    fn set_tag_normalizes_and_clears() {
+    fn multi_tag_and_predefined_tag_management() {
         let mut store = Store::default();
+        assert!(store.add_predefined_tag("#工作"));
+        assert!(!store.add_predefined_tag("工作"), "重复标签不应再添加");
+        assert!(!store.add_predefined_tag("   # "), "空白标签应拒绝");
+        assert!(store.add_predefined_tag("研发"));
+        assert_eq!(store.predefined_tags, vec!["工作", "研发"]);
+
         let id = store.add("a").unwrap();
+        assert!(store.toggle_item_tag(id, "工作"));
+        assert!(store.toggle_item_tag(id, "研发"));
+        assert_eq!(store.item(id).unwrap().tags, vec!["工作", "研发"]);
 
-        store.set_tag(id, Some("#工作"));
-        assert_eq!(store.item(id).unwrap().tag.as_deref(), Some("工作"));
+        assert!(store.toggle_item_tag(id, "工作"));
+        assert_eq!(store.item(id).unwrap().tags, vec!["研发"]);
 
-        store.set_tag(id, Some("  #  "));
-        assert_eq!(store.item(id).unwrap().tag, None, "纯 # 应清除标签");
-
-        store.set_tag(id, None);
-        assert_eq!(store.item(id).unwrap().tag, None);
+        assert!(store.remove_predefined_tag("研发"));
+        assert_eq!(store.predefined_tags, vec!["工作"]);
+        assert_eq!(
+            store.item(id).unwrap().tags,
+            vec!["研发"],
+            "删除预设标签不应抹掉已有待办上的标签"
+        );
     }
 
     #[test]
@@ -312,17 +440,19 @@ mod tests {
     }
 
     #[test]
-    fn prune_tag_filter_clears_when_tag_unused() {
+    fn prune_tag_filter_clears_when_tag_unused_on_today() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
         let mut store = Store::default();
-        let id = store.add("a").unwrap();
-        store.set_tag(id, Some("工作"));
+        let id = store.add_at("a", dt(24, 9)).unwrap();
+        store.set_tags(id, ["工作"]);
         store.tag_filter = Some("工作".into());
 
-        store.prune_tag_filter();
+        store.prune_tag_filter_on(today);
         assert_eq!(store.tag_filter.as_deref(), Some("工作"), "标签还在时不应清除");
 
-        store.set_tag(id, None);
-        store.prune_tag_filter();
-        assert_eq!(store.tag_filter, None, "标签消失后应清掉筛选");
+        // 设为昨日完成 → 今日不可见，筛选应清理
+        store.set_done_at(id, true, dt(24, 18));
+        store.prune_tag_filter_on(today);
+        assert_eq!(store.tag_filter, None, "昨日完成项不可见后应清掉筛选");
     }
 }

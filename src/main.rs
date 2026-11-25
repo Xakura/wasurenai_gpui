@@ -108,13 +108,22 @@ fn main() {
             });
             pump.detach();
 
-            // 每 500ms 对齐一次窗口层级：有到期提醒就自动上浮，确认完自动回落
+            // 每 500ms 对齐一次窗口层级，并监测跨天（零点自动隐藏昨日已完成项）
             let tick_state = state.clone();
             let tick_task = cx.spawn(async move |cx| {
+                let mut last_date = Local::now().date_naive();
                 loop {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(500))
                         .await;
+                    let today = Local::now().date_naive();
+                    if today != last_date {
+                        last_date = today;
+                        tick_state.update(cx, |app, cx| {
+                            app.on_day_changed(today);
+                            app.commit_runtime(true, cx);
+                        });
+                    }
                     cx.update(|app| ui::windows::sync_layer(app, tick_state.clone()));
                 }
             });

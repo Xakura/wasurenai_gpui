@@ -1,4 +1,4 @@
-//! 应用状态：待办数据、落盘、运行期状态（提醒确认）。
+//! 应用状态：待办数据、落盘、自动日志同步、运行期状态（提醒确认）。
 //!
 //! 这里**不持有窗口句柄、不做窗口操作**（见 `ui/mod.rs` 的硬约束）。
 //!
@@ -7,22 +7,24 @@
 //! - `commit_click` / `commit_typing`：由 UI 调用，负责通知重绘 + 防抖落盘。
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::NaiveDateTime;
+use chrono::{Local, NaiveDate, NaiveDateTime};
 
 // 只引入需要的类型：`use gpui_kit::*` 会把 gpui 的 `test` 模块也带进来，
 // 与下方测试模块里的 `#[test]` 属性宏打架（recursion limit reached）。
 use gpui_kit::Context;
 
 use crate::core::hotkey::HotkeySpec;
-use crate::core::model::{Store, TodoId, TodoItem, normalize_tag};
-use crate::core::{reminder, store};
+use crate::core::model::{Store, TodoId, TodoItem};
+use crate::core::{reminder, store, worklog};
 
 pub struct AppState {
     pub store: Store,
     path: PathBuf,
+    log_path: PathBuf,
     /// 防抖落盘用：每次修改自增，只有最新一代的定时任务会真正写盘。
     save_generation: u64,
     /// 是否有尚未落盘的防抖修改（退出或关窗时用 `flush_save` 强制写回）。
@@ -36,24 +38,25 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// 从默认路径加载（文件不存在或损坏都不会失败）。
+    /// 从默认路径加载（文件不存在或损坏都不会失败），并初始化同步一次自动日志。
     pub fn load() -> Self {
-        Self {
-            store: store::load(),
-            path: store::data_path(),
-            save_generation: 0,
-            dirty: false,
-            acked: HashSet::new(),
-            user_floated: false,
-            hotkey_error: None,
+        let state = Self::load_from(store::data_path());
+        if let Err(err) = state.sync_worklog_now() {
+            eprintln!(
+                "[wasurenai] 初始化同步日志 {} 失败：{err}",
+                state.log_path.display()
+            );
         }
+        state
     }
 
     /// 指定路径加载，便于测试与将来的"导入"功能。
     pub fn load_from(path: PathBuf) -> Self {
+        let log_path = worklog::log_path_for(&path);
         Self {
             store: store::load_from(&path),
             path,
+            log_path,
             save_generation: 0,
             dirty: false,
             acked: HashSet::new(),
@@ -62,28 +65,33 @@ impl AppState {
         }
     }
 
-    pub fn path(&self) -> &std::path::Path {
+    pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
     }
 
     // ---- 纯变更（返回是否有变化；不写盘、不通知，便于单测）----
 
     pub fn set_done(&mut self, id: TodoId, done: bool) -> bool {
-        match self.store.item_mut(id) {
-            Some(item) if item.done != done => {
-                item.done = done;
-                if done {
-                    // 勾完就没必要再提醒了
-                    self.acked.insert(id);
-                }
-                println!("[wasurenai] set_done id={id} done={done}");
-                true
+        self.set_done_at(id, done, Local::now().naive_local())
+    }
+
+    pub fn set_done_at(&mut self, id: TodoId, done: bool, now: NaiveDateTime) -> bool {
+        if self.store.set_done_at(id, done, now) {
+            if done {
+                // 勾完就没必要再提醒了
+                self.acked.insert(id);
             }
-            Some(_) => false,
-            None => {
+            println!("[wasurenai] set_done id={id} done={done}");
+            true
+        } else {
+            if self.store.item(id).is_none() {
                 eprintln!("[wasurenai] set_done 收到未知 id={id}（元素 id 接错了？）");
-                false
             }
+            false
         }
     }
 
@@ -117,17 +125,29 @@ impl AppState {
         changed
     }
 
-    pub fn set_tag(&mut self, id: TodoId, tag: Option<&str>) -> bool {
-        let normalized = tag.and_then(normalize_tag);
-        let changed = match self.store.item_mut(id) {
-            Some(item) if item.tag != normalized => {
-                item.tag = normalized;
-                true
-            }
-            _ => false,
-        };
+    pub fn toggle_item_tag(&mut self, id: TodoId, tag: &str) -> bool {
+        let changed = self.store.toggle_item_tag(id, tag);
         if changed {
             self.store.prune_tag_filter();
+        }
+        changed
+    }
+
+    pub fn add_predefined_tag(&mut self, raw: &str) -> bool {
+        let changed = self.store.add_predefined_tag(raw);
+        if changed {
+            println!("[wasurenai] add_predefined_tag -> {:?}", self.store.predefined_tags);
+        }
+        changed
+    }
+
+    pub fn remove_predefined_tag(&mut self, tag: &str) -> bool {
+        let changed = self.store.remove_predefined_tag(tag);
+        if changed {
+            println!(
+                "[wasurenai] remove_predefined_tag -> {:?}",
+                self.store.predefined_tags
+            );
         }
         changed
     }
@@ -138,17 +158,17 @@ impl AppState {
         Some(id)
     }
 
-    /// 一次性创建带截止时间和标签的新待办。空白文本返回 `None`。
+    /// 一次性创建带截止时间和多标签的新待办。空白文本返回 `None`。
     pub fn add_item_full(
         &mut self,
         text: &str,
         due: Option<NaiveDateTime>,
-        tag: Option<&str>,
+        tags: &[String],
     ) -> Option<TodoId> {
         let id = self.store.add(text)?;
         self.store.set_due(id, due);
-        self.store.set_tag(id, tag);
-        println!("[wasurenai] add_item_full id={id} due={due:?}");
+        self.store.set_tags(id, tags);
+        println!("[wasurenai] add_item_full id={id} due={due:?} tags={tags:?}");
         Some(id)
     }
 
@@ -161,25 +181,6 @@ impl AppState {
         } else {
             false
         }
-    }
-
-    /// 清除所有已完成的待办，返回清理条数。
-    pub fn clear_completed(&mut self) -> usize {
-        let mut removed = 0;
-        self.store.items.retain(|item| {
-            if item.done {
-                self.acked.remove(&item.id);
-                removed += 1;
-                false
-            } else {
-                true
-            }
-        });
-        if removed > 0 {
-            self.store.prune_tag_filter();
-            println!("[wasurenai] clear_completed count={removed}");
-        }
-        removed
     }
 
     pub fn toggle_tag_filter(&mut self, tag: &str) -> bool {
@@ -196,6 +197,12 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    /// 跨过零点时清理失效的标签筛选，并通知视图隐藏昨日已完成项。
+    pub fn on_day_changed(&mut self, today: NaiveDate) {
+        self.store.prune_tag_filter_on(today);
+        println!("[wasurenai] 日期切换 -> {today}");
     }
 
     // ---- 全局快捷键 ----
@@ -254,6 +261,16 @@ impl AppState {
         println!("[wasurenai] 提醒全部确认");
     }
 
+    // ---- 日志同步与导出 ----
+
+    pub fn sync_worklog_now(&self) -> io::Result<()> {
+        worklog::sync_to(&self.store.items, &self.log_path)
+    }
+
+    pub fn export_worklog_to(&self, dest: &Path) -> io::Result<()> {
+        worklog::sync_to(&self.store.items, dest)
+    }
+
     // ---- UI 入口：通知 + 防抖落盘 ----
 
     /// 点击类操作：立刻重绘，落盘防抖。
@@ -308,11 +325,17 @@ impl AppState {
         self.persist_now();
     }
 
-    /// 立即写盘。写失败只打印，不让 UI 崩（下次修改还会再试）。
+    /// 立即写盘并同步自动日志文件。写失败只打印，不让 UI 崩（下次修改还会再试）。
     pub fn persist_now(&mut self) {
         match self.store.save_to(&self.path) {
             Ok(()) => {
                 self.dirty = false;
+                if let Err(err) = self.sync_worklog_now() {
+                    eprintln!(
+                        "[wasurenai] 同步日志 {} 失败：{err}",
+                        self.log_path.display()
+                    );
+                }
                 println!(
                     "[wasurenai] 已保存（tag_filter={:?} done_ids={:?}）",
                     self.store.tag_filter,
@@ -332,7 +355,6 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -368,14 +390,16 @@ mod tests {
     }
 
     #[test]
-    fn set_done_reports_change_once() {
+    fn set_done_reports_change_once_and_sets_completed_at() {
         let (_dir, path) = TempDir::new();
         let mut state = AppState::load_from(path);
         let id = state.store.add("a").unwrap();
 
-        assert!(state.set_done(id, true), "值变化应返回 true");
-        assert!(!state.set_done(id, true), "值没变应返回 false");
-        assert!(state.store.item(id).unwrap().done);
+        assert!(state.set_done_at(id, true, dt(25, 14)), "值变化应返回 true");
+        assert!(!state.set_done_at(id, true, dt(25, 15)), "值没变应返回 false");
+        let item = state.store.item(id).unwrap();
+        assert!(item.done);
+        assert_eq!(item.completed_at, Some(dt(25, 14)));
     }
 
     #[test]
@@ -411,19 +435,17 @@ mod tests {
     }
 
     #[test]
-    fn set_tag_normalizes_and_prunes_filter() {
+    fn toggle_item_tag_and_prunes_filter() {
         let (_dir, path) = TempDir::new();
         let mut state = AppState::load_from(path);
         let id = state.store.add("a").unwrap();
-        state.set_tag(id, Some("工作"));
-        state.store.tag_filter = Some("工作".into());
+        assert!(state.toggle_item_tag(id, "工作"));
+        assert!(state.toggle_item_tag(id, "研发"));
+        assert_eq!(state.store.item(id).unwrap().tags, vec!["工作", "研发"]);
 
-        assert!(
-            !state.set_tag(id, Some("#工作")),
-            "规范化后与现值相同，不算变化"
-        );
-        assert!(state.set_tag(id, None));
-        assert_eq!(state.store.tag_filter, None, "标签清掉后筛选应被清理");
+        state.store.tag_filter = Some("工作".into());
+        assert!(state.toggle_item_tag(id, "工作"));
+        assert_eq!(state.store.tag_filter, None, "标签取消后筛选应被清理");
     }
 
     #[test]
@@ -437,17 +459,22 @@ mod tests {
     }
 
     #[test]
-    fn persist_now_writes_file() {
+    fn persist_now_writes_json_and_syncs_worklog() {
         let (_dir, path) = TempDir::new();
         let mut state = AppState::load_from(path.clone());
         let id = state.add_item("交周报").unwrap();
-        state.set_done(id, true);
+        state.toggle_item_tag(id, "工作");
+        state.set_done_at(id, true, dt(25, 16));
 
         assert!(!path.exists(), "纯变更不应写盘");
         state.persist_now();
 
         let reloaded = store::load_from(&path);
         assert!(reloaded.item(id).unwrap().done);
+
+        let log_text = fs::read_to_string(state.log_path()).expect("应自动生成日志文件");
+        assert!(log_text.contains("## 2026-11-25"));
+        assert!(log_text.contains("- [16:00] 交周报 `#工作`"));
     }
 
     #[test]
@@ -486,39 +513,20 @@ mod tests {
     }
 
     #[test]
-    fn add_item_full_sets_due_and_tag() {
+    fn add_item_full_sets_due_and_tags() {
         let (_dir, path) = TempDir::new();
         let mut state = AppState::load_from(path);
+        let tags = vec!["#工作".to_string(), "研发".to_string()];
         let id = state
-            .add_item_full("  提交季报 ", Some(dt(21, 18)), Some("#工作"))
+            .add_item_full("  提交季报 ", Some(dt(21, 18)), &tags)
             .expect("应成功创建");
         let item = state.store.item(id).unwrap();
         assert_eq!(item.text, "提交季报");
         assert_eq!(item.due, Some(dt(21, 18)));
-        assert_eq!(item.tag.as_deref(), Some("工作"));
+        assert_eq!(item.tags, vec!["工作", "研发"]);
+        assert!(item.created_at.is_some());
 
-        assert_eq!(state.add_item_full("   ", Some(dt(21, 18)), None), None);
-    }
-
-    #[test]
-    fn clear_completed_removes_only_done() {
-        let (_dir, path) = TempDir::new();
-        let mut state = AppState::load_from(path);
-        let keep = state.add_item("未完成").unwrap();
-        let done_one = state.add_item("已完成1").unwrap();
-        let done_two = state.add_item("已完成2").unwrap();
-        state.set_tag(done_one, Some("工作"));
-        state.store.tag_filter = Some("工作".into());
-        state.set_done(done_one, true);
-        state.set_done(done_two, true);
-
-        let cleared = state.clear_completed();
-        assert_eq!(cleared, 2);
-        assert!(state.store.item(keep).is_some());
-        assert!(state.store.item(done_one).is_none());
-        assert!(state.store.item(done_two).is_none());
-        assert_eq!(state.store.tag_filter, None, "被删标签使用为空后应清理筛选");
-        assert_eq!(state.clear_completed(), 0);
+        assert_eq!(state.add_item_full("   ", Some(dt(21, 18)), &[]), None);
     }
 
     #[test]

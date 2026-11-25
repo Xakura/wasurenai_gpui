@@ -50,7 +50,9 @@ mod tests {
             text: format!("item{id}"),
             done,
             due,
-            tag: None,
+            tags: Vec::new(),
+            created_at: None,
+            completed_at: None,
         }
     }
 

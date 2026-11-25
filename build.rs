@@ -18,7 +18,42 @@ fn main() {
     let res_bytes = build_icon_res(&[16, 32, 48, 64]);
     fs::write(&res_path, res_bytes).expect("write wasurenai_icon.res");
 
+    let ico_path = out_dir.join("wasurenai.ico");
+    let ico_bytes = build_icon_ico(&[16, 32, 48, 64, 256]);
+    fs::write(&ico_path, ico_bytes).expect("write wasurenai.ico");
+
     println!("cargo:rustc-link-arg-bins={}", res_path.display());
+}
+
+/// 生成标准多分辨率 `.ico`（含 16..=256px），供安装包向导图标复用。
+fn build_icon_ico(sizes: &[u32]) -> Vec<u8> {
+    let entries: Vec<(u32, Vec<u8>)> = sizes.iter().map(|&s| (s, build_icon_dib(s))).collect();
+    let dir_len = 6 + entries.len() * 16;
+    let total_dibs: usize = entries.iter().map(|(_, d)| d.len()).sum();
+
+    let mut ico = Vec::with_capacity(dir_len + total_dibs);
+    ico.extend_from_slice(&0u16.to_le_bytes()); // idReserved
+    ico.extend_from_slice(&1u16.to_le_bytes()); // idType = ICO
+    ico.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+
+    let mut offset = dir_len as u32;
+    for (size, dib) in &entries {
+        let dim = if *size >= 256 { 0 } else { *size as u8 };
+        ico.push(dim); // bWidth
+        ico.push(dim); // bHeight
+        ico.push(0); // bColorCount
+        ico.push(0); // bReserved
+        ico.extend_from_slice(&1u16.to_le_bytes()); // wPlanes
+        ico.extend_from_slice(&32u16.to_le_bytes()); // wBitCount
+        ico.extend_from_slice(&(dib.len() as u32).to_le_bytes());
+        ico.extend_from_slice(&offset.to_le_bytes());
+        offset += dib.len() as u32;
+    }
+
+    for (_, dib) in entries {
+        ico.extend_from_slice(&dib);
+    }
+    ico
 }
 
 fn build_icon_res(sizes: &[u32]) -> Vec<u8> {

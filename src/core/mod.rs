@@ -9,3 +9,4 @@ pub mod ordering;
 pub mod reminder;
 pub mod store;
 pub mod timeparse;
+pub mod worklog;

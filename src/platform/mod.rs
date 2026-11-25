@@ -4,6 +4,7 @@
 
 pub mod autostart;
 pub mod icon;
+pub mod shell;
 pub mod single_instance;
 pub mod win_layer;
 pub mod win_thread;

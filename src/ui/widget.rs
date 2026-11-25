@@ -165,7 +165,8 @@ impl WidgetWindow {
 
     fn current_panel_order(&self, cx: &App) -> Vec<TodoId> {
         let app = self.state.read(cx);
-        let visible_ids: Vec<TodoId> = ordering::visible(&app.store)
+        let today = chrono::Local::now().date_naive();
+        let visible_ids: Vec<TodoId> = ordering::visible_on(&app.store, today)
             .into_iter()
             .map(|item| item.id)
             .collect();
@@ -240,7 +241,8 @@ impl WidgetWindow {
     fn start_slide(&mut self, old_order: Vec<TodoId>, cx: &mut Context<Self>) {
         let new_order: Vec<TodoId> = {
             let app = self.state.read(cx);
-            ordering::visible(&app.store)
+            let today = chrono::Local::now().date_naive();
+            ordering::visible_on(&app.store, today)
                 .into_iter()
                 .map(|item| item.id)
                 .collect()
@@ -281,13 +283,14 @@ impl Render for WidgetWindow {
 
         let state = self.state.clone();
         let now = chrono::Local::now().naive_local();
+        let today = now.date();
 
         let (reminder, active_tag, tags, pending) = {
             let app = state.read(cx);
             (
                 !app.due_items(now).is_empty(),
                 app.store.tag_filter.clone(),
-                ordering::tags(&app.store.items),
+                ordering::tags_on(&app.store.items, today),
                 ordering::pending_count(&app.store.items),
             )
         };
@@ -309,7 +312,7 @@ impl Render for WidgetWindow {
                     .map(|item| Row::from_item(item, now))
                     .collect()
             } else {
-                let sorted = ordering::visible(&app.store);
+                let sorted = ordering::visible_on(&app.store, today);
                 let by_id: HashMap<TodoId, &crate::core::model::TodoItem> =
                     sorted.iter().map(|item| (item.id, *item)).collect();
                 let ordered_ids = match &self.settling_order {
