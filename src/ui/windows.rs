@@ -4,9 +4,7 @@
 use gpui_kit::*;
 
 use crate::core::ordering;
-use crate::platform::icon;
-use crate::platform::win_layer::{self, Layer};
-use crate::platform::win_thread::{self, PlatformCommand};
+use crate::platform::{self, NativeWindow, PlatformCommand, WindowLayer};
 use crate::ui::editor::{EditorWindow, Tab};
 use crate::ui::state::AppState;
 use crate::ui::widget::{PanelMotion, WidgetWindow};
@@ -52,17 +50,9 @@ pub fn widget_bounds(cx: &mut App) -> Bounds<Pixels> {
     )
 }
 
-/// 从 gpui 窗口拿 Win32 HWND。
-pub(crate) fn hwnd_of(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let handle = HasWindowHandle::window_handle(window).ok()?;
-    match handle.as_raw() {
-        RawWindowHandle::Win32(win32) => Some(windows::Win32::Foundation::HWND(
-            win32.hwnd.get() as *mut core::ffi::c_void
-        )),
-        _ => None,
-    }
+/// 从 GPUI 窗口提取平台无关的原生句柄。
+fn native_window_of(window: &Window) -> Option<NativeWindow> {
+    NativeWindow::from_window(window)
 }
 
 /// 打开桌面层窗口。
@@ -114,13 +104,13 @@ pub fn open_widget(cx: &mut App, state: Entity<AppState>) {
 fn reveal_hidden_widget(
     cx: &mut App,
     handle: AnyWindowHandle,
-    target: Layer,
+    target: WindowLayer,
     motion: PanelMotion,
 ) -> bool {
     let layered = handle
         .update(cx, |_, window, _| {
-            let hwnd = hwnd_of(window)?;
-            win_layer::set_layer(hwnd, target);
+            let native = native_window_of(window)?;
+            platform::window::set_layer(native, target);
             Some(())
         })
         .ok()
@@ -142,8 +132,8 @@ fn reveal_hidden_widget(
     }
 
     let _ = handle.update(cx, |_, window, _| {
-        if let Some(hwnd) = hwnd_of(window) {
-            win_layer::set_visible(hwnd, true);
+        if let Some(native) = native_window_of(window) {
+            platform::window::set_visible(native, true);
         }
     });
     true
@@ -207,9 +197,9 @@ pub fn toggle_widget(cx: &mut App, state: Entity<AppState>) {
                     return;
                 }
                 let _ = handle.update(app, |_, window, _| {
-                    if let Some(hwnd) = hwnd_of(window) {
-                        win_layer::set_visible(hwnd, false);
-                        win_layer::set_layer(hwnd, Layer::Bottom);
+                    if let Some(native) = native_window_of(window) {
+                        platform::window::set_visible(native, false);
+                        platform::window::set_layer(native, WindowLayer::Bottom);
                     }
                 });
                 if let Some(view) = app.global::<Windows>().widget_view.clone() {
@@ -235,7 +225,7 @@ pub fn toggle_float(cx: &mut App, state: Entity<AppState>) {
             return;
         };
 
-        if !reveal_hidden_widget(cx, handle, Layer::Top, PanelMotion::FloatIn) {
+        if !reveal_hidden_widget(cx, handle, WindowLayer::Top, PanelMotion::FloatIn) {
             clear_widget_handles(cx);
             state.update(cx, |app, _| app.user_floated = true);
             open_widget(cx, state.clone());
@@ -271,13 +261,13 @@ fn has_due_reminders(cx: &App, state: &Entity<AppState>) -> bool {
 }
 
 /// 期望的层级：用户手动上浮 或 有到期提醒 → 置顶；否则沉底。
-fn desired_layer(cx: &App, state: &Entity<AppState>) -> Layer {
+fn desired_layer(cx: &App, state: &Entity<AppState>) -> WindowLayer {
     let app = state.read(cx);
     let now = chrono::Local::now().naive_local();
     if app.user_floated || !app.due_items(now).is_empty() {
-        Layer::Top
+        WindowLayer::Top
     } else {
-        Layer::Bottom
+        WindowLayer::Bottom
     }
 }
 
@@ -308,15 +298,15 @@ fn finish_raise_to_top(
         win.widget_view.clone()
     };
 
-    if desired_layer(cx, &state) != Layer::Top {
+    if desired_layer(cx, &state) != WindowLayer::Top {
         if let Some(view) = view {
             view.update(cx, |w, cx| w.play_motion(PanelMotion::SettleFadeIn, cx));
         }
         return;
     }
 
-    if let Some(hwnd) = hwnd_of(window) {
-        let ok = win_layer::set_layer(hwnd, Layer::Top);
+    if let Some(native) = native_window_of(window) {
+        let ok = platform::window::set_layer(native, WindowLayer::Top);
         println!("[wasurenai] 层级 -> Top ok={ok}");
     }
     if let Some(view) = view {
@@ -345,7 +335,7 @@ pub fn sync_layer(cx: &mut App, state: Entity<AppState>) {
     }
 
     if !was_shown && must_show {
-        if !reveal_hidden_widget(cx, handle, Layer::Top, PanelMotion::FloatIn) {
+        if !reveal_hidden_widget(cx, handle, WindowLayer::Top, PanelMotion::FloatIn) {
             clear_widget_handles(cx);
             sync_tray(cx, &state);
             return;
@@ -361,7 +351,7 @@ pub fn sync_layer(cx: &mut App, state: Entity<AppState>) {
     }
 
     match target {
-        Layer::Top => {
+        WindowLayer::Top => {
             if dropping {
                 // 仍在 Top 态播放回落淡出时取消回落：无需重新 SetWindowPos，直接原地 FloatIn
                 let view = {
@@ -374,7 +364,7 @@ pub fn sync_layer(cx: &mut App, state: Entity<AppState>) {
                 if let Some(view) = view {
                     view.update(cx, |w, cx| w.play_motion(PanelMotion::FloatIn, cx));
                 }
-            } else if win_layer::current_layer() != Layer::Top && !raising {
+            } else if platform::window::current_layer() != WindowLayer::Top && !raising {
                 let visible = handle
                     .update(cx, |_, window, _| Some(window.is_visible()))
                     .ok()
@@ -382,7 +372,12 @@ pub fn sync_layer(cx: &mut App, state: Entity<AppState>) {
                 match visible {
                     None => clear_widget_handles(cx),
                     Some(false) => {
-                        if !reveal_hidden_widget(cx, handle, Layer::Top, PanelMotion::FloatIn) {
+                        if !reveal_hidden_widget(
+                            cx,
+                            handle,
+                            WindowLayer::Top,
+                            PanelMotion::FloatIn,
+                        ) {
                             clear_widget_handles(cx);
                         }
                     }
@@ -411,7 +406,7 @@ pub fn sync_layer(cx: &mut App, state: Entity<AppState>) {
                 }
             }
         }
-        Layer::Bottom => {
+        WindowLayer::Bottom => {
             if raising {
                 // 在第 2 帧升层之前又切回 Bottom：取消升层并平滑恢复桌面层显示，避免留在透明态
                 let view = {
@@ -423,7 +418,7 @@ pub fn sync_layer(cx: &mut App, state: Entity<AppState>) {
                 if let Some(view) = view {
                     view.update(cx, |w, cx| w.play_motion(PanelMotion::SettleFadeIn, cx));
                 }
-            } else if win_layer::current_layer() == Layer::Top && !dropping {
+            } else if platform::window::current_layer() == WindowLayer::Top && !dropping {
                 let (generation, view) = {
                     let win = cx.global_mut::<Windows>();
                     win.dropping_to_bottom = true;
@@ -449,13 +444,13 @@ pub fn sync_layer(cx: &mut App, state: Entity<AppState>) {
                             return;
                         }
                         app.global_mut::<Windows>().dropping_to_bottom = false;
-                        if desired_layer(app, &drop_state) != Layer::Bottom {
+                        if desired_layer(app, &drop_state) != WindowLayer::Bottom {
                             return;
                         }
                         let applied = handle
                             .update(app, |_, window, _| {
-                                let hwnd = hwnd_of(window)?;
-                                let ok = win_layer::set_layer(hwnd, Layer::Bottom);
+                                let native = native_window_of(window)?;
+                                let ok = platform::window::set_layer(native, WindowLayer::Bottom);
                                 println!("[wasurenai] 层级 -> Bottom ok={ok}");
                                 Some(())
                             })
@@ -498,7 +493,7 @@ pub fn sync_tray(cx: &mut App, state: &Entity<AppState>) {
         return;
     }
     cx.global_mut::<Windows>().last_tray = Some(snapshot);
-    win_thread::send_command(PlatformCommand::UpdateTray {
+    platform::service::send_command(PlatformCommand::UpdateTray {
         pending,
         overdue,
         widget_visible,
@@ -561,8 +556,8 @@ pub fn open_editor(cx: &mut App, state: Entity<AppState>, tab: Tab) {
             cx.global_mut::<Windows>().editor_view = Some(view);
             // 新建的窗口不一定会被系统提到前台（实测会被终端等窗口挡住），同时设置内嵌窗口图标
             let _ = handle.update(cx, |_, window, _| {
-                if let Some(hwnd) = hwnd_of(window) {
-                    icon::apply_window_icon(hwnd);
+                if let Some(native) = native_window_of(window) {
+                    platform::window::apply_window_icon(native);
                 }
                 window.activate_window();
             });

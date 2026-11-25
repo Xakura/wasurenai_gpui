@@ -9,7 +9,7 @@ use gpui_kit::*;
 use wasurenai_gpui::{core, platform, ui};
 
 fn main() {
-    let Some(_instance_guard) = platform::single_instance::SingleInstanceGuard::acquire() else {
+    let Some(_instance_guard) = platform::SingleInstanceGuard::acquire() else {
         println!("[wasurenai] 已有实例在运行，退出重复启动");
         return;
     };
@@ -129,7 +129,7 @@ fn main() {
             });
             tick_task.detach();
 
-            platform::win_thread::spawn(tx, initial_hotkey, initial_pending, initial_overdue);
+            platform::service::spawn(tx, initial_hotkey, initial_pending, initial_overdue);
 
             // 启动一律展开：上次是收起状态也开，避免用户下次启动看不到面板以为坏了。
             // （widget_visible 仍然记录/落盘，只是不作为启动条件。）

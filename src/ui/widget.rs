@@ -7,7 +7,7 @@
 //!   逐条「知道了」/「全部知道了」/ 勾选完成后自动回到面板并回落桌面层。
 //!
 //! 这个窗口是"裸窗口"（没有 `gpui_base::Root`），所以不能依赖 Root 提供的
-//! Tooltip / Dialog / Popover / Notification；勾选框用 [`crate::ui::widgets::tick_box`] 手绘。
+//! Tooltip / Dialog / Popover / Notification；勾选框用 [`crate::ui::panel_checkbox::tick_box`] 手绘。
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -20,11 +20,10 @@ use gpui_kit::*;
 
 use crate::core::model::TodoId;
 use crate::core::ordering;
-use crate::platform::win_layer;
+use crate::platform::{self, NativeWindow, WindowLayer};
+use crate::ui::panel_checkbox::tick_box;
 use crate::ui::state::AppState;
 use crate::ui::theme::panel;
-use crate::ui::widgets::tick_box;
-use crate::ui::windows::hwnd_of;
 
 const ROW_GAP: f32 = 2.0;
 const DEFAULT_ROW_HEIGHT: f32 = 30.0;
@@ -145,22 +144,18 @@ impl WidgetWindow {
         cx.notify();
     }
 
-    /// 首帧：接管窗口（owner + 子类化 + 压到桌面层）。
+    /// 首帧：接管窗口（置底与无任务栏属性由平台层处理）。
     fn init_window(&mut self, window: &Window) {
         if self.initialized {
             return;
         }
         self.initialized = true;
 
-        let Some(hwnd) = hwnd_of(window) else {
-            eprintln!("[wasurenai] 拿不到窗口 HWND，置底失败");
+        let Some(native) = NativeWindow::from_window(window) else {
+            eprintln!("[wasurenai] 拿不到原生窗口句柄，置底失败");
             return;
         };
-        let ok = win_layer::attach(hwnd);
-        println!(
-            "[wasurenai] 桌面层接管={ok} 子类化={} hwnd={hwnd:?}",
-            win_layer::subclassed()
-        );
+        let _ = platform::window::attach_desktop_panel(native);
     }
 
     fn current_panel_order(&self, cx: &App) -> Vec<TodoId> {
@@ -332,7 +327,7 @@ impl Render for WidgetWindow {
         let empty = rows.is_empty();
         let view = cx.entity();
         let anim_seq = self.anim_seq;
-        let is_top = win_layer::current_layer() == win_layer::Layer::Top;
+        let is_top = platform::window::current_layer() == WindowLayer::Top;
 
         let card = div()
             .id("widget-card")

@@ -1,15 +1,15 @@
 ﻿; Wasurenai Windows 安装脚本（Inno Setup 6，当前用户免 UAC 安装）
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.2.0"
 #endif
 
 #ifndef ExePath
-  #define ExePath "..\target\release\wasurenai_gpui.exe"
+  #define ExePath "..\..\target\release\wasurenai_gpui.exe"
 #endif
 
 #ifndef OutputDir
-  #define OutputDir "..\dist"
+  #define OutputDir "..\..\dist"
 #endif
 
 [Setup]
@@ -52,7 +52,7 @@ Name: "{autoprograms}\Wasurenai"; Filename: "{app}\wasurenai_gpui.exe"
 Name: "{autodesktop}\Wasurenai"; Filename: "{app}\wasurenai_gpui.exe"; Tasks: desktopicon
 
 [Registry]
-; 与 src/platform/autostart.rs 完全一致：HKCU Run 键值带双引号
+; 与 src/platform/windows/autostart.rs 完全一致：HKCU Run 键值带双引号
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Wasurenai"; ValueData: """{app}\wasurenai_gpui.exe"""; Flags: uninsdeletevalue; Tasks: autostart
 
 [Run]

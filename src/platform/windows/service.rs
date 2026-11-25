@@ -1,4 +1,4 @@
-//! 托盘图标 + 全局热键所在的"平台线程"。
+//! Windows 托盘图标 + 全局热键专用消息泵线程。
 //!
 //! 为什么必须单开一个线程：`tray-icon` 内部是 `Rc`（非 `Send`），并且要求在**创建它
 //! 的线程上有一个 Win32 消息泵**；`global-hotkey` 的 `RegisterHotKey` 也要求同一个
@@ -12,19 +12,19 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_channel::Sender;
-use windows::Win32::Foundation::{LPARAM, WPARAM};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use tray_icon::{
     TrayIconBuilder,
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
+use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, TranslateMessage, WM_APP, WM_QUIT,
 };
 
 use crate::core::hotkey::HotkeySpec;
-use crate::platform::{PlatformEvent, icon};
+use crate::platform::{PlatformCommand, PlatformEvent, icon};
 
 /// 唤醒消息泵用的自定义消息。
 const WM_APP_COMMAND: u32 = WM_APP + 1;
@@ -35,38 +35,20 @@ static CURRENT_ID: AtomicU32 = AtomicU32::new(0);
 /// 平台线程 id，供 UI → 平台方向唤醒泵。
 static PUMP_THREAD: OnceLock<u32> = OnceLock::new();
 
-/// UI 发给平台线程的命令。
-#[derive(Debug, Clone)]
-pub enum PlatformCommand {
-    /// 重新注册全局快捷键。
-    SetHotkey(HotkeySpec),
-    /// 录制快捷键期间临时注销旧热键，避免按下原组合键时误触上浮。
-    PauseHotkey,
-    /// 取消录制后恢复原先的全局快捷键。
-    ResumeHotkey,
-    /// 同步托盘提示、图标状态与「收起 / 展开」菜单文案。
-    UpdateTray {
-        pending: usize,
-        overdue: usize,
-        widget_visible: bool,
-    },
-}
+/// 命令队列（创建一次，供任意线程投递）。
+static COMMAND_QUEUE: OnceLock<Sender<PlatformCommand>> = OnceLock::new();
 
-/// 给平台线程发命令（必要时先启动它）。返回是否成功唤醒。
+/// 给平台线程发命令。返回是否成功唤醒。
 pub fn send_command(cmd: PlatformCommand) -> bool {
     let Some(thread_id) = PUMP_THREAD.get() else {
         eprintln!("[wasurenai] 平台线程还没就绪，命令被丢弃");
         return false;
     };
-    // 命令由泵线程自己从 channel 里取，这条线程消息只负责把它叫醒。
     if let Some(queue) = COMMAND_QUEUE.get() {
         let _ = queue.send_blocking(cmd);
     }
     unsafe { PostThreadMessageW(*thread_id, WM_APP_COMMAND, WPARAM(0), LPARAM(0)).is_ok() }
 }
-
-/// 命令队列（创建一次，供任意线程投递）。
-static COMMAND_QUEUE: OnceLock<Sender<PlatformCommand>> = OnceLock::new();
 
 /// 启动平台线程。`initial_hotkey` / `initial_pending` / `initial_overdue` 用于首帧初始化托盘与热键。
 pub fn spawn(
@@ -81,7 +63,6 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("wasurenai-platform".into())
         .spawn(move || unsafe {
-            // 托盘图标必须活到消息泵结束：一旦 drop，图标就从托盘里消失了。
             let tray_bundle = match create_tray(tx.clone(), initial_pending, initial_overdue) {
                 Ok(bundle) => Some(bundle),
                 Err(err) => {
@@ -103,7 +84,6 @@ pub fn spawn(
                     break;
                 }
                 if msg.message == WM_APP_COMMAND {
-                    // 把积压的命令都处理掉
                     while let Ok(command) = command_rx.try_recv() {
                         match command {
                             PlatformCommand::SetHotkey(spec) => hotkeys.apply(spec),
@@ -120,9 +100,8 @@ pub fn spawn(
                                     toggle_item.set_text(toggle_label(widget_visible));
                                     let next_icon_state = (pending > 0, overdue > 0);
                                     if next_icon_state != last_icon_state {
-                                        let _ = tray.set_icon(Some(icon::tray_icon(
-                                            pending, overdue,
-                                        )));
+                                        let _ = tray
+                                            .set_icon(Some(icon::tray_icon(pending, overdue)));
                                         last_icon_state = next_icon_state;
                                     }
                                 }
@@ -144,7 +123,6 @@ fn get_current_thread_id() -> u32 {
 
 /// 全局热键的注册/换绑。
 struct Hotkeys {
-    /// 创建失败时为 None：热键用不了，但托盘还得工作。
     manager: Option<GlobalHotKeyManager>,
     current: Option<HotKey>,
     saved_spec: Option<HotkeySpec>,
@@ -237,7 +215,6 @@ impl Hotkeys {
     }
 }
 
-/// 把规范化的快捷键翻译成 `global_hotkey` 的组合键。
 fn to_hotkey(spec: &HotkeySpec) -> Option<HotKey> {
     let mut modifiers = Modifiers::empty();
     if spec.ctrl {
@@ -352,7 +329,6 @@ fn create_tray(
         .with_icon(icon::tray_icon(initial_pending, initial_overdue))
         .build()?;
 
-    // 菜单事件在平台线程的消息泵里派发，这里只负责把事件转发出去。
     let tx_menu = tx.clone();
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let mapped = if event.id == edit_id {

@@ -1,4 +1,4 @@
-//! 桌面层（bottom）/ 置顶层（top）切换。
+//! Windows 桌面层（Bottom）/ 置顶层（Top）切换。
 //!
 //! 方案来自 `SQSora/desktop_bottom` 的 Windows 实现，**不是** `SetParent(WorkerW)`：
 //!
@@ -8,10 +8,8 @@
 //! - 在 `WM_WINDOWPOSCHANGING` 里强制 `hwndInsertAfter = HWND_BOTTOM`，
 //!   点击、任务栏激活都抬不到普通窗口上面；同一个消息里拦掉 Win+D 的隐藏移动。
 //! - 快捷键 / 到期提醒要把窗口"上浮"时，只需 `SetWindowPos(HWND_TOPMOST)` 并把
-//!   [`Layer`] 切成 `Top`：此时不再强制置底，窗口就浮到最上层（owner 保持不变，
+//!   [`WindowLayer`] 切成 `Top`：此时不再强制置底，窗口就浮到最上层（owner 保持不变，
 //!   所以仍然不进任务栏）。
-//!
-//! 已知限制：Explorer 重启会连带销毁被 owner 的窗口（见 docs/plan.md 风险表）。
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
@@ -30,27 +28,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, w};
 
+use crate::platform::WindowLayer;
+
 static SUBCLASSED: AtomicBool = AtomicBool::new(false);
-static LAYER: AtomicU8 = AtomicU8::new(Layer::Bottom as u8);
+static LAYER: AtomicU8 = AtomicU8::new(WindowLayer::Bottom as u8);
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 const SUBCLASS_ID: usize = 0x57A5_0FA1;
 /// Win+D 会把窗口挪到这个坐标附近来"隐藏"它。
 const HIDDEN_POSITION: i32 = -30000;
 
-/// 窗口当前所处的层级。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Layer {
-    /// 桌面层：在所有普通窗口之下，Win+D 时仍可见。
-    Bottom = 0,
-    /// 置顶层：浮在所有窗口之上（快捷键 / 到期提醒）。
-    Top = 1,
-}
-
-pub fn current_layer() -> Layer {
+pub fn current_layer() -> WindowLayer {
     match LAYER.load(Ordering::Relaxed) {
-        x if x == Layer::Top as u8 => Layer::Top,
-        _ => Layer::Bottom,
+        x if x == WindowLayer::Top as u8 => WindowLayer::Top,
+        _ => WindowLayer::Bottom,
     }
 }
 
@@ -79,7 +70,7 @@ pub fn attach(hwnd: HWND) -> bool {
         let ok = SetWindowSubclass(hwnd, proc, SUBCLASS_ID, 0).as_bool();
         SUBCLASSED.store(ok, Ordering::Relaxed);
 
-        let moved = set_layer(hwnd, Layer::Bottom);
+        let moved = set_layer(hwnd, WindowLayer::Bottom);
         ok && moved
     }
 }
@@ -137,14 +128,16 @@ unsafe fn disable_dwm_frame(hwnd: HWND) {
 }
 
 /// 切换层级。`Top` 时窗口浮到最上层，`Bottom` 时压回桌面层。
-pub fn set_layer(hwnd: HWND, layer: Layer) -> bool {
+pub fn set_layer(hwnd: HWND, layer: WindowLayer) -> bool {
     LAYER.store(layer as u8, Ordering::Relaxed);
 
     unsafe {
         let no_activate = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
         match layer {
-            Layer::Top => SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, no_activate).is_ok(),
-            Layer::Bottom => {
+            WindowLayer::Top => {
+                SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, no_activate).is_ok()
+            }
+            WindowLayer::Bottom => {
                 let normal = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, no_activate);
                 let bottom = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, no_activate);
                 normal.is_ok() && bottom.is_ok()
@@ -154,8 +147,6 @@ pub fn set_layer(hwnd: HWND, layer: Layer) -> bool {
 }
 
 /// 显示 / 隐藏窗口（收起展开用）。
-///
-/// 使用同步 `ShowWindow`，确保展开动画首帧开始时窗口句柄已处于可见状态。
 pub fn set_visible(hwnd: HWND, visible: bool) -> bool {
     let cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
     unsafe {
@@ -188,7 +179,7 @@ unsafe extern "system" fn layer_proc(
     }
 
     // 只有置于桌面层时才需要拦消息：置顶状态下让系统正常处理。
-    if msg == WM_WINDOWPOSCHANGING && current_layer() == Layer::Bottom {
+    if msg == WM_WINDOWPOSCHANGING && current_layer() == WindowLayer::Bottom {
         let pos = lparam.0 as *mut WINDOWPOS;
         if !pos.is_null() {
             let pos = unsafe { &mut *pos };

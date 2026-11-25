@@ -12,7 +12,6 @@ use windows::core::{PCWSTR, w};
 const RUN_SUBKEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const VALUE_NAME: PCWSTR = w!("Wasurenai");
 
-/// 当前是否已在注册表 Run 键里启用了开机自启。
 pub fn is_enabled() -> bool {
     unsafe {
         let mut hkey = HKEY::default();
@@ -23,16 +22,13 @@ pub fn is_enabled() -> bool {
         let mut size = 0u32;
         let query = RegQueryValueExW(hkey, VALUE_NAME, None, None, None, Some(&mut size));
         let _ = RegCloseKey(hkey);
-        // 带空终止符的 UTF-16 至少大于 2 字节才算有效路径
         query == ERROR_SUCCESS && size > 2
     }
 }
 
-/// 启用或取消开机自启。
 pub fn set_enabled(enabled: bool) -> Result<(), String> {
     if enabled {
-        let exe = std::env::current_exe()
-            .map_err(|err| format!("无法获取程序路径：{err}"))?;
+        let exe = std::env::current_exe().map_err(|err| format!("无法获取程序路径：{err}"))?;
         let command = format_run_command(&exe);
         let wide = to_utf16_bytes(&command);
         unsafe {
@@ -77,12 +73,10 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// 把可执行文件路径包进双引号，防止路径带空格时开机启动解析出错。
 pub(crate) fn format_run_command(exe: &Path) -> String {
     format!("\"{}\"", exe.display())
 }
 
-/// 编码成带结尾 NUL 的 UTF-16LE 字节流供 `REG_SZ` 使用。
 pub(crate) fn to_utf16_bytes(value: &str) -> Vec<u8> {
     value
         .encode_utf16()

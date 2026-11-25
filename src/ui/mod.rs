@@ -12,8 +12,8 @@
 //!   用裸 `cx.open_window`。
 
 pub mod editor;
+pub mod panel_checkbox;
 pub mod state;
 pub mod theme;
 pub mod widget;
-pub mod widgets;
 pub mod windows;

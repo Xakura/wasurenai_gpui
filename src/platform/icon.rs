@@ -1,13 +1,4 @@
-//! 极简几何待办图标：矢量 SDF 抗锯齿渲染（托盘图标）与窗口图标加载。
-
-use tray_icon::Icon;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, LoadImageW, SM_CXICON,
-    SM_CXSMICON, SM_CYICON, SM_CYSMICON, SendMessageW, WM_SETICON,
-};
-use windows::core::PCWSTR;
+//! 极简几何待办图标：纯跨平台矢量 SDF 抗锯齿 RGBA 渲染与托盘图标构建。
 
 const DOT_AMBER: [u8; 3] = [0xf5, 0x9e, 0x0b];
 const DOT_RED: [u8; 3] = [0xef, 0x44, 0x44];
@@ -19,7 +10,8 @@ pub fn render_rgba(size: u32, badge: bool) -> Vec<u8> {
     render_rgba_dot(size, badge.then_some(DOT_AMBER))
 }
 
-fn render_rgba_dot(size: u32, dot: Option<[u8; 3]>) -> Vec<u8> {
+/// 生成带可选状态角标的 RGBA 图标像素。
+pub fn render_rgba_dot(size: u32, dot: Option<[u8; 3]>) -> Vec<u8> {
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
     if size == 0 {
         return rgba;
@@ -87,7 +79,8 @@ fn render_rgba_dot(size: u32, dot: Option<[u8; 3]>) -> Vec<u8> {
 }
 
 /// 托盘图标：32×32，有逾期用红点，有未完成用琥珀点，全部完成为纯净蓝底白勾。
-pub fn tray_icon(pending: usize, overdue: usize) -> Icon {
+#[cfg(target_os = "windows")]
+pub fn tray_icon(pending: usize, overdue: usize) -> tray_icon::Icon {
     let dot = if overdue > 0 {
         Some(DOT_RED)
     } else if pending > 0 {
@@ -96,44 +89,7 @@ pub fn tray_icon(pending: usize, overdue: usize) -> Icon {
         None
     };
     let rgba = render_rgba_dot(32, dot);
-    Icon::from_rgba(rgba, 32, 32).expect("内置托盘图标 RGBA 数据合法")
-}
-
-/// 从 exe 内嵌资源（ID = 1）加载图标并应用到窗口标题栏与任务栏。
-///
-/// 在未链接 `.res` 资源的环境（如某些示例）下静默降级，不报错。
-pub fn apply_window_icon(hwnd: HWND) {
-    unsafe {
-        let Ok(module) = GetModuleHandleW(None) else {
-            return;
-        };
-        let hinst = HINSTANCE(module.0);
-        // Win32 MAKEINTRESOURCEW(1)：把整数资源 ID 1 编进低 16 位指针传入 LoadImageW
-        let res_id = PCWSTR(std::ptr::without_provenance(1));
-
-        let small_w = GetSystemMetrics(SM_CXSMICON).max(16);
-        let small_h = GetSystemMetrics(SM_CYSMICON).max(16);
-        if let Ok(handle) = LoadImageW(Some(hinst), res_id, IMAGE_ICON, small_w, small_h, LR_SHARED)
-        {
-            SendMessageW(
-                hwnd,
-                WM_SETICON,
-                Some(WPARAM(ICON_SMALL as usize)),
-                Some(LPARAM(handle.0 as isize)),
-            );
-        }
-
-        let big_w = GetSystemMetrics(SM_CXICON).max(32);
-        let big_h = GetSystemMetrics(SM_CYICON).max(32);
-        if let Ok(handle) = LoadImageW(Some(hinst), res_id, IMAGE_ICON, big_w, big_h, LR_SHARED) {
-            SendMessageW(
-                hwnd,
-                WM_SETICON,
-                Some(WPARAM(ICON_BIG as usize)),
-                Some(LPARAM(handle.0 as isize)),
-            );
-        }
-    }
+    tray_icon::Icon::from_rgba(rgba, 32, 32).expect("内置托盘图标 RGBA 数据合法")
 }
 
 fn rounded_box_sdf(u: f32, v: f32, half: f32, radius: f32) -> f32 {

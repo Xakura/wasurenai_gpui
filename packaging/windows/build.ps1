@@ -2,9 +2,9 @@
 .SYNOPSIS
     构建 Wasurenai Release 二进制并使用 Inno Setup 6 生成 Windows 安装包。
 .EXAMPLE
-    pwsh -File installer/build.ps1
+    pwsh -File packaging/windows/build.ps1
 .EXAMPLE
-    pwsh -File installer/build.ps1 -Version 0.0.1 -SkipBuild
+    pwsh -File packaging/windows/build.ps1 -Version 0.0.1 -SkipBuild
 #>
 [CmdletBinding()]
 param(
@@ -14,7 +14,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$RepoRoot = Split-Path -Parent $PSScriptRoot
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $CargoTomlPath = Join-Path $RepoRoot 'Cargo.toml'
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
