@@ -61,13 +61,17 @@ if (-not (Test-Path $ExePath)) {
     throw "未找到可执行文件：$ExePath"
 }
 
-$IconFile = Get-ChildItem -Path (Join-Path $RepoRoot 'target\release\build') -Filter 'wasurenai.ico' -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -match 'wasurenai_gpui-' } |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
+$IconFile = @(
+    (Join-Path $RepoRoot 'target\release'),
+    (Join-Path $RepoRoot 'target')
+) | ForEach-Object {
+    if (Test-Path $_) {
+        Get-ChildItem -Path $_ -Filter 'wasurenai.ico' -Recurse -ErrorAction SilentlyContinue
+    }
+} | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
 if (-not $IconFile) {
-    throw "未在 target\release\build\wasurenai_gpui-*\out\ 下找到 wasurenai.ico，请确认未跳过 build.rs 生成。"
+    throw "未在 target 目录下找到 wasurenai.ico，请确认未跳过 build.rs 生成。"
 }
 
 $DistDir = Join-Path $RepoRoot 'dist'
